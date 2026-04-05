@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+# maps · cassette.help · MIT
+"""
+polycule — CLI for the Polycule multi-agent hub.
+
+Commands:
+  init          Interactive setup wizard — creates polycule.toml
+  start         Start hub + TUI (full launch)
+  hub           Start just the hub
+  tui           Start just the chat TUI
+  agents        Launch all agents from polycule.toml in the background
+  agent         Launch a specific adapter by type (claude, codex, shell)
+  approve       Toggle auto-approve mode (on/off)
+  status        Check hub status
+
+Run 'polycule <command> --help' for command-specific options.
+"""
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECT_DIR = Path(__file__).parent.parent
+SRC_DIR     = PROJECT_DIR / 'src'
+sys.path.insert(0, str(SRC_DIR))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_init(args):
+    """Run the interactive setup wizard."""
+    init_script = Path(__file__).parent / 'polycule-init'
+    os.execv(sys.executable, [sys.executable, str(init_script)])
+
+
+def cmd_hub(args):
+    """Start just the hub."""
+    hub_py = SRC_DIR / 'backend' / 'hub.py'
+    os.execv(sys.executable, [sys.executable, str(hub_py)])
+
+
+def cmd_tui(args):
+    """Start just the chat TUI."""
+    tui_py = SRC_DIR / 'ui' / 'chat_tui.py'
+    extra = []
+    if args.name:
+        extra += ['--name', args.name]
+    if args.room:
+        extra += ['--room', args.room]
+    if args.host:
+        extra += ['--host', args.host]
+    if args.port:
+        extra += ['--port', str(args.port)]
+    os.execv(sys.executable, [sys.executable, str(tui_py)] + extra)
+
+
+def cmd_start(args):
+    """Start hub + TUI (foreground hub, then TUI in same terminal after hub ready)."""
+    from config import load_config
+    cfg = load_config()
+
+    name = args.name or cfg.tui.default_name
+    room = args.room or cfg.tui.default_room
+    host = args.host or cfg.hub.host
+    port = args.port or cfg.hub.port
+
+    # Start hub in background
+    hub_py = SRC_DIR / 'backend' / 'hub.py'
+    logs_dir = PROJECT_DIR / 'logs'
+    logs_dir.mkdir(exist_ok=True)
+
+    hub_log = open(logs_dir / 'hub.log', 'a')
+    hub_proc = subprocess.Popen(
+        [sys.executable, str(hub_py)],
+        stdout=hub_log, stderr=hub_log,
+    )
+    print(f"Hub started (PID {hub_proc.pid}) → logs/hub.log")
+
+    # Wait for hub to be ready
+    for _ in range(20):
+        time.sleep(0.25)
+        try:
+            import socket
+            s = socket.create_connection((host, port), timeout=0.2)
+            s.close()
+            break
+        except OSError:
+            pass
+    else:
+        print("Warning: hub may not be ready yet")
+
+    # Start TUI (foreground)
+    tui_py = SRC_DIR / 'ui' / 'chat_tui.py'
+    os.execv(sys.executable, [
+        sys.executable, str(tui_py),
+        '--name', name, '--room', room,
+        '--host', host, '--port', str(port),
+    ])
+
+
+def cmd_agents(args):
+    """Launch all enabled agents from polycule.toml as background processes."""
+    from config import load_config
+    cfg = load_config()
+
+    if not cfg.agents:
+        print("No agents configured. Run 'polycule init' or edit polycule.toml.")
+        sys.exit(1)
+
+    logs_dir = PROJECT_DIR / 'logs'
+    logs_dir.mkdir(exist_ok=True)
+
+    for agent in cfg.agents:
+        log_path = logs_dir / f"{agent.name.lower()}.log"
+        log_file = open(log_path, 'a')
+
+        script, extra_args = _agent_script_and_args(agent)
+        cmd = [sys.executable, str(script)] + extra_args
+
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+        print(f"  {agent.name} (PID {proc.pid}) → logs/{agent.name.lower()}.log")
+
+    print(f"\n{len(cfg.agents)} agent(s) running in background.")
+    print("Logs: logs/<name>.log  |  Stop: pkill -f polycule")
+
+
+def _agent_script_and_args(agent) -> tuple[Path, list[str]]:
+    """Return (script_path, extra_args) for a configured agent."""
+    base = [
+        '--name', agent.name,
+        '--room', agent.room,
+    ]
+    if agent.always:
+        base += ['--always']
+    for t in agent.triggers:
+        base += ['--trigger', t]
+
+    if agent.adapter == 'claude':
+        return SRC_DIR / 'agents' / 'claude_adapter.py', base
+    elif agent.adapter == 'codex':
+        return SRC_DIR / 'agents' / 'codex_adapter.py', base
+    elif agent.adapter == 'hermes':
+        hermes_args = list(base)
+        if agent.profile:
+            hermes_args += ['--profile', agent.profile]
+        if agent.timeout:
+            hermes_args += ['--timeout', str(agent.timeout)]
+        return SRC_DIR / 'agents' / 'hermes_adapter.py', hermes_args
+    elif agent.adapter == 'shell':
+        if not agent.command:
+            raise ValueError(f"Agent {agent.name!r} has adapter=shell but no command")
+        return SRC_DIR / 'agents' / 'shell_adapter.py', base + ['--command', agent.command]
+    else:
+        raise ValueError(f"Unknown adapter type {agent.adapter!r} for agent {agent.name!r}")
+
+
+def cmd_agent(args):
+    """Launch a specific agent adapter."""
+    agent_scripts = {
+        'claude': SRC_DIR / 'agents' / 'claude_adapter.py',
+        'codex':  SRC_DIR / 'agents' / 'codex_adapter.py',
+        'shell':  SRC_DIR / 'agents' / 'shell_adapter.py',
+    }
+
+    script = agent_scripts.get(args.agent_type)
+    if not script:
+        print(f"Unknown agent type: {args.agent_type}")
+        print("Available: claude, codex, shell")
+        sys.exit(1)
+
+    extra = []
+    if args.name:
+        extra += ['--name', args.name]
+    if args.room:
+        extra += ['--room', args.room]
+    if args.host:
+        extra += ['--host', args.host]
+    if args.port:
+        extra += ['--port', str(args.port)]
+    if getattr(args, 'always', False):
+        extra += ['--always']
+    if getattr(args, 'command', None):
+        extra += ['--command', args.command]
+
+    os.execv(sys.executable, [sys.executable, str(script)] + extra)
+
+
+def cmd_approve(args):
+    """Toggle auto-approve mode."""
+    value = args.setting.lower() not in ('off', '0', 'false', 'no')
+    asyncio.run(_send_hub_command({
+        'type': 'command', 'command': 'set_auto_approve', 'value': value
+    }))
+    print(f"Auto-approve {'enabled' if value else 'disabled'}")
+
+
+def cmd_status(args):
+    """Check if hub is reachable."""
+    asyncio.run(_check_status(args.host, args.port))
+
+
+async def _send_hub_command(msg: dict, host: str = 'localhost', port: int = 7777):
+    try:
+        r, w = await asyncio.open_connection(host, port)
+        handshake = {'type': 'handshake', 'name': 'polycule-cli', 'agent_type': 'human', 'room_name': 'Default'}
+        w.write((json.dumps(handshake) + '\n').encode())
+        await w.drain()
+        data = await asyncio.wait_for(r.readline(), timeout=3.0)
+        response = json.loads(data.decode().strip())
+        if response.get('action') == 'awaiting_room':
+            join = {'type': 'command', 'command': 'create_room', 'room_name': 'Default'}
+            w.write((json.dumps(join) + '\n').encode())
+            await w.drain()
+            await asyncio.wait_for(r.readline(), timeout=3.0)
+        w.write((json.dumps(msg) + '\n').encode())
+        await w.drain()
+        w.close()
+        await w.wait_closed()
+    except Exception as e:
+        print(f"Hub command failed: {e}", file=sys.stderr)
+
+
+async def _check_status(host: str = 'localhost', port: int = 7777):
+    try:
+        _, w = await asyncio.open_connection(host, port)
+        w.close()
+        print(f"Hub: UP ({host}:{port})")
+    except ConnectionRefusedError:
+        print(f"Hub: DOWN (nothing on {host}:{port})")
+    except Exception as e:
+        print(f"Hub: ERROR — {e}")
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog='polycule', description='Polycule multi-agent hub CLI')
+    sub = p.add_subparsers(dest='command', metavar='COMMAND')
+
+    sub.add_parser('init', help='Interactive setup wizard')
+
+    # hub
+    sub.add_parser('hub', help='Start just the hub')
+
+    # tui
+    t = sub.add_parser('tui', help='Start just the chat TUI')
+    t.add_argument('--name',              help='Your name in chat')
+    t.add_argument('--room',              help='Room to join')
+    t.add_argument('--host', default='localhost')
+    t.add_argument('--port', type=int, default=7777)
+
+    # start
+    s = sub.add_parser('start', help='Start hub + TUI')
+    s.add_argument('--name',              help='Your name in chat')
+    s.add_argument('--room',              help='Room to join')
+    s.add_argument('--host', default='localhost')
+    s.add_argument('--port', type=int, default=None)
+
+    # agents
+    sub.add_parser('agents', help='Launch all configured agents (from polycule.toml)')
+
+    # agent
+    a = sub.add_parser('agent', help='Launch a specific adapter')
+    a.add_argument('agent_type', choices=['claude', 'codex', 'shell'], metavar='TYPE')
+    a.add_argument('--name',    default=None)
+    a.add_argument('--room',    default='Main')
+    a.add_argument('--host',    default='localhost')
+    a.add_argument('--port',    type=int, default=7777)
+    a.add_argument('--always',  action='store_true')
+    a.add_argument('--command', default=None, help='Shell command (shell adapter only)')
+
+    # approve
+    ap = sub.add_parser('approve', help='Toggle auto-approve mode')
+    ap.add_argument('setting', choices=['on', 'off'])
+
+    # status
+    st = sub.add_parser('status', help='Check hub status')
+    st.add_argument('--host', default='localhost')
+    st.add_argument('--port', type=int, default=7777)
+
+    return p
+
+
+COMMAND_HANDLERS = {
+    'init':    cmd_init,
+    'hub':     cmd_hub,
+    'tui':     cmd_tui,
+    'start':   cmd_start,
+    'agents':  cmd_agents,
+    'agent':   cmd_agent,
+    'approve': cmd_approve,
+    'status':  cmd_status,
+}
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+    handler = COMMAND_HANDLERS.get(args.command)
+    if not handler:
+        parser.print_help()
+        sys.exit(1)
+    handler(args)
+
+
+if __name__ == '__main__':
+    main()

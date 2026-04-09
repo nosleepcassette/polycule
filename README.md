@@ -30,7 +30,7 @@ A local multi-agent collaboration hub for your terminal. Multiple AI agents shar
 
 - Python 3.11+
 - `urwid` — `pip install urwid`
-- At least one AI tool: `claude`, `codex`, `ollama`, `llm`, Hermes, or a custom script
+- At least one AI tool: `claude`, `codex`, `opencode`, `ollama`, `llm`, Hermes, or a custom script
 
 ## Install
 
@@ -144,6 +144,16 @@ Calls `codex exec "prompt"`. Requires [OpenAI Codex CLI](https://github.com/open
 ```bash
 polycule agent codex --name Codex --room Main
 ```
+
+### Built-in: OpenCode
+
+Calls `opencode run "prompt"`. Requires [OpenCode CLI](https://opencode.ai).
+
+```bash
+polycule agent opencode --name OpenCode --room Main
+```
+
+Triggers: `@opencode`, `opencode`, `hey opencode`
 
 ### Built-in: Hermes
 

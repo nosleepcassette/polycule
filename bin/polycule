@@ -156,8 +156,6 @@ def _agent_script_and_args(agent) -> tuple[Path, list[str]]:
         if not agent.command:
             raise ValueError(f"Agent {agent.name!r} has adapter=shell but no command")
         return SRC_DIR / 'agents' / 'shell_adapter.py', base + ['--command', agent.command]
-    elif agent.adapter == 'opencode':
-        return SRC_DIR / 'agents' / 'opencode_adapter.py', base
     else:
         raise ValueError(f"Unknown adapter type {agent.adapter!r} for agent {agent.name!r}")
 
@@ -165,17 +163,15 @@ def _agent_script_and_args(agent) -> tuple[Path, list[str]]:
 def cmd_agent(args):
     """Launch a specific agent adapter."""
     agent_scripts = {
-        'claude':   SRC_DIR / 'agents' / 'claude_adapter.py',
-        'codex':    SRC_DIR / 'agents' / 'codex_adapter.py',
-        'hermes':   SRC_DIR / 'agents' / 'hermes_adapter.py',
-        'opencode': SRC_DIR / 'agents' / 'opencode_adapter.py',
-        'shell':    SRC_DIR / 'agents' / 'shell_adapter.py',
+        'claude': SRC_DIR / 'agents' / 'claude_adapter.py',
+        'codex':  SRC_DIR / 'agents' / 'codex_adapter.py',
+        'shell':  SRC_DIR / 'agents' / 'shell_adapter.py',
     }
 
     script = agent_scripts.get(args.agent_type)
     if not script:
         print(f"Unknown agent type: {args.agent_type}")
-        print("Available: claude, codex, hermes, opencode, shell")
+        print("Available: claude, codex, shell")
         sys.exit(1)
 
     extra = []
@@ -273,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # agent
     a = sub.add_parser('agent', help='Launch a specific adapter')
-    a.add_argument('agent_type', choices=['claude', 'codex', 'hermes', 'opencode', 'shell'], metavar='TYPE')
+    a.add_argument('agent_type', choices=['claude', 'codex', 'shell'], metavar='TYPE')
     a.add_argument('--name',    default=None)
     a.add_argument('--room',    default='Main')
     a.add_argument('--host',    default='localhost')

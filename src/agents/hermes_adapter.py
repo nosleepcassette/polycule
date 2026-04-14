@@ -2,22 +2,37 @@
 """
 Hermes Adapter for Polycule Hub
 
-Connects a Hermes AI agent to the hub. Hermes is a stateless CLI agent —
-each invocation starts fresh and receives the conversation context injected
-into its prompt.
+Hermes is a TUI REPL (like Claude Code). It has no persistent session —
+each invocation starts fresh unless --resume SESSION_ID is passed.
 
-Auto-discovers the hermes binary from PATH or common install locations.
-Supports named profiles (hermes chat --profile <name>) for different personas.
+Two Hermes agents:
+  cassette  → hermes chat -Q -q "prompt"               (default profile)
+  wizard    → hermes chat --profile wizard -Q -q "prompt"
+
+This adapter calls Hermes in non-interactive, quiet mode (-Q -q) for each
+message it responds to. Context from the chat log is injected into the prompt
+so the stateless agent has the necessary background.
+
+Optionally pass --resume SESSION_ID to resume a prior session.
 
 Usage:
-    python3 hermes_adapter.py --name Cassette --room Main
-    python3 hermes_adapter.py --name Wizard --profile wizard --room Main
-    python3 hermes_adapter.py --name Research --profile research --always
+    # Run as cassette (default)
+    python3 hermes_adapter.py --name Cassette --room Default
+
+    # Run as wizard
+    python3 hermes_adapter.py --name Wizard --profile wizard --room Default
+
+    # Respond to all messages (not just mentions)
+    python3 hermes_adapter.py --name Wizard --profile wizard --always
+
+    # Resume a prior session
+    python3 hermes_adapter.py --name Wizard --profile wizard --resume abc123
 """
+
 import argparse
 import asyncio
 import logging
-import shutil
+import re
 import subprocess
 import sys
 import time
@@ -26,54 +41,80 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from agents.base_adapter import BaseAdapter, AgentConfig
+from hermes_sessions import (
+    hermes_session_exists,
+    newest_hermes_session_id,
+    normalize_hermes_profile,
+    rename_hermes_session,
+    snapshot_hermes_sessions,
+)
+from runtime_state import (
+    clear_agent_session_entry,
+    get_agent_session_entry,
+    get_or_allocate_agent_session_title,
+    make_agent_session_key,
+    normalize_session_title,
+    update_agent_session_entry,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 240.0
+HERMES_BIN = Path.home() / ".hermes" / "bin" / "hermes"
+DEFAULT_HERMES_TIMEOUT_SECONDS = 240.0
+BOOTSTRAP_CONTEXT_LIMIT = 60
+RESUME_FALLBACK_CONTEXT_LIMIT = 20
+_RESUME_BANNER_RE = re.compile(
+    r"^↻ Resumed session\s+(?P<session_id>\S+)(?:\s+\"(?P<title>[^\"]+)\")?"
+)
+_TRAILING_SESSION_ID_RE = re.compile(
+    r"^\s*session_id:\s*(?P<session_id>\S+)\s*$",
+    re.MULTILINE,
+)
 
-# Common install locations, checked in order if hermes is not on PATH
-_HERMES_SEARCH_PATHS = [
-    Path.home() / ".hermes" / "bin" / "hermes",
-    Path("/usr/local/bin/hermes"),
-    Path("/opt/homebrew/bin/hermes"),
-    Path.home() / ".local" / "bin" / "hermes",
-]
+# Trigger words that cause Hermes to respond
+CASSETTE_MENTION_TRIGGERS = frozenset({"@cassette", "@hermes"})
+CASSETTE_HUMAN_TRIGGERS = frozenset({"cassette", "hermes"})
+WIZARD_MENTION_TRIGGERS = frozenset({"@wizard"})
+WIZARD_HUMAN_TRIGGERS = frozenset({"wizard"})
 
+# All agent trigger words — used to detect when a message is exclusively
+# addressed to a different agent (cross-address exclusion).
+_ALL_AGENT_TRIGGERS = (
+    CASSETTE_MENTION_TRIGGERS
+    | CASSETTE_HUMAN_TRIGGERS
+    | WIZARD_MENTION_TRIGGERS
+    | WIZARD_HUMAN_TRIGGERS
+    | frozenset({"@claude", "claude", "@codex", "codex"})
+)
 
-def _find_hermes() -> Optional[Path]:
-    """Return the path to the hermes binary, or None if not found."""
-    found = shutil.which("hermes")
-    if found:
-        return Path(found)
-    for candidate in _HERMES_SEARCH_PATHS:
-        if candidate.exists():
-            return candidate
-    return None
+SYSTEM_PROMPT_CASSETTE = """You are Cassette, a Hermes AI agent participating in the \
+Polycule multi-agent workspace. You are collaborating with the human operator and potentially \
+other agents. Be helpful, direct, and technically precise. Respond concisely."""
 
-
-SYSTEM_PROMPT_DEFAULT = """\
-You are {name}, an AI agent participating in a multi-agent terminal workspace called Polycule. \
-You are collaborating with a human user and potentially other agents in a shared chat room. \
-Be helpful, direct, and technically precise. Respond concisely.\
-"""
+SYSTEM_PROMPT_WIZARD = """You are Wizard, a Hermes AI agent participating in the Polycule \
+multi-agent workspace. You are direct, technically sharp, and occasionally sardonic. \
+You collaborate with the human operator, Cassette, Claude, and Codex. If you disagree, say so. \
+Don't pad your responses."""
 
 
 class HermesAdapter(BaseAdapter):
     """
-    Hermes adapter — calls `hermes chat [-Q] [-q prompt]` for each response.
+    Hermes adapter — supports cassette (default) and wizard profiles.
+    Calls `hermes chat -Q -q "prompt"` for each response.
     """
 
     def __init__(
         self,
-        name: str = "Hermes",
-        profile: Optional[str] = None,
-        room: str = "Main",
+        name: str = "Cassette",
+        profile: str = "cassette",
+        room: str = "Default",
         hub_host: str = "localhost",
         hub_port: int = 7777,
         always_respond: bool = False,
-        triggers: Optional[list[str]] = None,
-        system_prompt: Optional[str] = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        always_all: bool = False,
+        resume_session: Optional[str] = None,
+        session_title: Optional[str] = None,
+        timeout_seconds: float = DEFAULT_HERMES_TIMEOUT_SECONDS,
     ):
         config = AgentConfig(
             name=name,
@@ -83,29 +124,73 @@ class HermesAdapter(BaseAdapter):
             hub_port=hub_port,
         )
         super().__init__(config)
-        self.profile = profile
+        self.profile = profile.lower()
         self.always_respond = always_respond
-        self.timeout = max(1.0, float(timeout))
+        self.always_all = always_all
+        self.resume_session = resume_session
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
         self._responding = False
 
-        self._triggers: frozenset[str] = frozenset(
-            t.lower() for t in (triggers or [f"@{name.lower()}", name.lower()])
-        )
-        self._system_prompt = (
-            system_prompt
-            or SYSTEM_PROMPT_DEFAULT.format(name=name)
-        )
+        # Set triggers and system prompt based on profile
+        if self.profile == "wizard":
+            self._mention_triggers = WIZARD_MENTION_TRIGGERS
+            self._human_word_triggers = WIZARD_HUMAN_TRIGGERS
+            self._system_prompt = SYSTEM_PROMPT_WIZARD
+        else:
+            self._mention_triggers = CASSETTE_MENTION_TRIGGERS
+            self._human_word_triggers = CASSETTE_HUMAN_TRIGGERS
+            self._system_prompt = SYSTEM_PROMPT_CASSETTE
 
-        self._hermes_bin = _find_hermes()
-        if not self._hermes_bin:
-            logger.warning(
-                "hermes binary not found. Checked PATH and common locations. "
-                "Install hermes or set it on PATH."
-            )
+        self.profile = normalize_hermes_profile(self.profile)
+        self.session_key = make_agent_session_key(
+            "hermes",
+            room,
+            profile=self.profile,
+        )
+        self.session_title = normalize_session_title(session_title)
+        self.last_acknowledged_message_id: Optional[str] = None
+        self._hydrate_managed_session_state()
+        if not self.session_title or self.session_title.lower().startswith("polycule:"):
+            self.session_title = get_or_allocate_agent_session_title(self.session_key)
+        self._last_session_event_id = self.resume_session
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Build hermes command
+    # -----------------------------------------------------------------------
+
+    def _build_cmd(self, prompt: str) -> list:
+        """Build the hermes chat invocation for non-interactive one-shot use."""
+        cmd = [str(HERMES_BIN), "chat", "-Q", "-q", prompt]
+        if self.profile not in ("cassette", "default", ""):
+            cmd = [
+                str(HERMES_BIN),
+                "chat",
+                "--profile",
+                self.profile,
+                "-Q",
+                "-q",
+                prompt,
+            ]
+        if self.resume_session:
+            cmd += ["--resume", self.resume_session]
+        return cmd
+
+    # -----------------------------------------------------------------------
     # Trigger logic
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+
+    def _exclusively_addressed_to_other(self, content: str) -> bool:
+        """True if message mentions another agent but not this agent.
+
+        Used to prevent always-mode agents from responding to messages
+        that are clearly directed at a different agent (e.g. wizard ignoring
+        'okay cassette, can you...' when cassette but not wizard is named).
+        """
+        my_triggers = self._mention_triggers | self._human_word_triggers
+        if self.has_any_trigger(content, my_triggers):
+            return False  # message includes me — respond
+        other_triggers = _ALL_AGENT_TRIGGERS - my_triggers
+        return self.has_any_trigger(content, other_triggers)
 
     def _should_respond(self, message: dict) -> bool:
         if self._responding:
@@ -116,86 +201,300 @@ class HermesAdapter(BaseAdapter):
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
         sender_type = sender.get("type", "").lower()
-        content = message.get("content", "").lower()
+        content = message.get("content", "")
 
+        if self.always_all:
+            return True
         if self.always_respond:
-            return sender_type == "human"
+            if sender_type != "human":
+                return False
+            # Skip if message is explicitly addressed to a different agent
+            return not self._exclusively_addressed_to_other(content)
+        if self._watch_matches_message(message):
+            return True
 
-        return any(t in content for t in self._triggers)
+        if sender_type == "human":
+            return self.has_any_trigger(
+                content, self._mention_triggers | self._human_word_triggers
+            )
+        return self.has_any_trigger(content, self._mention_triggers)
 
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
     # Prompt construction
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
 
-    def _build_context_log(self) -> str:
+    def _hydrate_managed_session_state(self):
+        entry = get_agent_session_entry(self.session_key)
+        if not entry:
+            return
+
+        stored_session_id = str(entry.get("session_id", "")).strip()
+        if stored_session_id and not hermes_session_exists(self.profile, stored_session_id):
+            clear_agent_session_entry(self.session_key)
+            return
+
+        stored_title = normalize_session_title(entry.get("title", ""))
+        if not self.session_title and stored_title:
+            self.session_title = stored_title
+        if not self.resume_session and stored_session_id:
+            self.resume_session = stored_session_id
+
+        stored_last_message_id = str(entry.get("last_message_id", "")).strip()
+        if stored_last_message_id:
+            self.last_acknowledged_message_id = stored_last_message_id
+
+    @staticmethod
+    def _sanitize_hermes_output(output: str) -> tuple[str, dict[str, object]]:
+        text = output or ""
+        metadata: dict[str, object] = {}
+
+        trailing_ids = [
+            match.group("session_id")
+            for match in _TRAILING_SESSION_ID_RE.finditer(text)
+        ]
+        if trailing_ids:
+            metadata["session_id"] = trailing_ids[-1]
+            text = _TRAILING_SESSION_ID_RE.sub("", text)
+
+        lines = text.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+        if lines and lines[0].lstrip().startswith("↻ Resumed session "):
+            banner = lines.pop(0).strip()
+            match = _RESUME_BANNER_RE.match(banner)
+            if match:
+                metadata["resumed"] = True
+                metadata.setdefault("session_id", match.group("session_id"))
+                if match.group("title"):
+                    metadata["session_title"] = match.group("title")
+            if lines:
+                next_line = lines[0].strip()
+                if next_line and (
+                    "total messages)" in next_line
+                    or next_line.startswith("message,")
+                    or next_line.endswith("messages)")
+                ):
+                    lines.pop(0)
+
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        return "\n".join(lines).strip(), metadata
+
+    def _persist_session_state(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        last_message_id: Optional[str] = None,
+    ):
+        update_agent_session_entry(
+            self.session_key,
+            agent_family="hermes",
+            profile=self.profile,
+            room=self.config.room_name,
+            agent_name=self.config.name,
+            title=self.session_title,
+            session_id=session_id or self.resume_session,
+            last_message_id=last_message_id,
+        )
+        if last_message_id:
+            self.last_acknowledged_message_id = last_message_id
+
+    def _capture_session_id(
+        self,
+        session_snapshot: Optional[dict[str, float]],
+        *,
+        output_session_id: Optional[str] = None,
+        output_session_title: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        previous_session_id = self.resume_session
+        detected_session_id = (output_session_id or self.resume_session or "").strip()
+        if not detected_session_id:
+            detected_session_id = newest_hermes_session_id(
+                self.profile,
+                changed_since=session_snapshot,
+            ) or ""
+        if not detected_session_id:
+            detected_session_id = newest_hermes_session_id(self.profile) or ""
+        if not detected_session_id:
+            return None, None
+
+        self.resume_session = detected_session_id
+        observed_title = normalize_session_title(output_session_title)
+        if detected_session_id != previous_session_id or (
+            observed_title and observed_title != self.session_title
+        ):
+            rename_hermes_session(detected_session_id, self.session_title)
+        self._persist_session_state(session_id=detected_session_id)
+
+        if not previous_session_id:
+            return detected_session_id, "created"
+        if detected_session_id != previous_session_id:
+            return detected_session_id, "changed"
+        return detected_session_id, None
+
+    async def _emit_session_event(self, state: str, session_id: str):
+        if not self.room_id or not session_id:
+            return
+        if session_id == self._last_session_event_id:
+            return
+        await self.send_command(
+            "agent_session",
+            state=state,
+            session_id=session_id,
+            session_title=self.session_title,
+        )
+        self._last_session_event_id = session_id
+
+    def _prompt_context_messages(self, message: dict) -> tuple[list[dict], str]:
+        messages = [
+            m
+            for m in self.context_messages
+            if isinstance(m, dict) and m.get("type") == "message"
+        ]
+        if not messages:
+            return [], "bootstrap"
+
+        if not self.resume_session:
+            return messages[-BOOTSTRAP_CONTEXT_LIMIT:], "bootstrap"
+
+        if not self.last_acknowledged_message_id:
+            return messages[-RESUME_FALLBACK_CONTEXT_LIMIT:], "resume_bootstrap"
+
+        last_index = None
+        for idx, ctx_msg in enumerate(messages):
+            if ctx_msg.get("id") == self.last_acknowledged_message_id:
+                last_index = idx
+                break
+
+        if last_index is None:
+            return messages[-RESUME_FALLBACK_CONTEXT_LIMIT:], "resume_fallback"
+
+        delta = messages[last_index + 1 :]
+        if not delta:
+            return [message], "delta"
+        return delta, "delta"
+
+    def _build_context_log(self, message: dict) -> tuple[str, str]:
+        prompt_messages, scope = self._prompt_context_messages(message)
         lines = []
-        for m in self.context_messages[-60:]:
-            if not isinstance(m, dict) or m.get("type") != "message":
-                continue
+        for m in prompt_messages:
             sender = m.get("sender", {})
             lines.append(f"[{sender.get('name', '?')}]: {m.get('content', '')}")
-        return "\n".join(lines) if lines else "(no prior messages)"
+        return ("\n".join(lines) if lines else "(no prior messages)"), scope
 
     def _build_prompt(self, message: dict) -> str:
         sender = message.get("sender", {})
-        sender_name = sender.get("name", "User")
+        sender_name = sender.get("name", "Unknown")
         content = message.get("content", "")
-        context = self._build_context_log()
+        context, scope = self._build_context_log(message)
+        section_header = "Recent chat log"
+        if scope == "delta":
+            section_header = "New chat messages since your last handled turn"
+        elif scope.startswith("resume_"):
+            section_header = "Recent chat messages to refresh local context"
         return (
             f"{self._system_prompt}\n\n"
-            f"--- Recent chat ---\n{context}\n--- End of chat ---\n\n"
-            f"{sender_name}: {content}\n\n"
-            f"{self.config.name}:"
+            f"--- {section_header} ---\n{context}\n--- End of log ---\n\n"
+            f"{sender_name} says: {content}\n\n"
+            f"Your response:"
         )
 
-    # ------------------------------------------------------------------
-    # Hermes invocation
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Hermes call
+    # -----------------------------------------------------------------------
 
-    def _build_cmd(self, prompt: str) -> list[str]:
-        if not self._hermes_bin:
-            raise RuntimeError("hermes binary not found")
-        cmd = [str(self._hermes_bin), "chat", "-Q", "-q", prompt]
-        if self.profile:
-            cmd = [str(self._hermes_bin), "chat", "--profile", self.profile, "-Q", "-q", prompt]
-        return cmd
-
-    async def _call_hermes(self, prompt: str) -> tuple[Optional[str], str, float]:
+    async def _call_hermes(self, prompt: str) -> tuple[Optional[str], str, float, str]:
         started = time.monotonic()
-        if not self._hermes_bin:
-            return None, "missing_bin", 0.0
+        session_snapshot = None
+
+        # Broadcast typing started
+        if self.room_id:
+            await self.send_command("agent_typing", is_typing=True)
+
+        if not HERMES_BIN.exists():
+            detail = f"Hermes binary not found: {HERMES_BIN}"
+            logger.error(detail)
+            return None, "missing_bin", 0.0, detail
+
+        if not self.resume_session:
+            session_snapshot = snapshot_hermes_sessions(self.profile)
+        cmd = self._build_cmd(prompt)
+        logger.info(
+            f"Calling hermes ({self.profile} profile, {len(prompt)} char prompt)"
+        )
 
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
-                self._build_cmd(prompt),
+                cmd,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=self.timeout_seconds,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - started
-            logger.warning(f"{self.config.name}: hermes timed out after {self.timeout:.0f}s")
-            return None, "timeout", elapsed
+            detail = (
+                f"{self.profile} profile timed out after {self.timeout_seconds:.1f}s"
+            )
+            logger.warning(detail)
+            # Broadcast tool failure
+            if self.room_id:
+                await self.send_command("agent_typing", is_typing=False)
+                await self.send_command(
+                    "agent_tool_use", tool_name="hermes", status="failed"
+                )
+            return None, "timeout", elapsed, detail
         except Exception as e:
             elapsed = time.monotonic() - started
-            logger.error(f"{self.config.name}: hermes call failed: {e}")
-            return None, "error", elapsed
+            detail = f"Hermes execution failed: {e}"
+            logger.error(detail)
+            # Broadcast error
+            if self.room_id:
+                await self.send_command("agent_typing", is_typing=False)
+                await self.send_command(
+                    "agent_tool_use", tool_name="hermes", status="failed"
+                )
+            return None, "error", elapsed, detail
 
         elapsed = time.monotonic() - started
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
-            logger.warning(f"{self.config.name}: hermes exited {result.returncode}: {stderr[:200]}")
-            return None, "error", elapsed
+            detail = (
+                f"Hermes exited {result.returncode}: {(stderr or 'no stderr')[:200]}"
+            )
+            logger.warning(detail)
+            return None, "error", elapsed, detail
 
-        output = (result.stdout or "").strip()
+        output, output_meta = self._sanitize_hermes_output((result.stdout or "").strip())
+        session_id, session_event = self._capture_session_id(
+            session_snapshot,
+            output_session_id=str(output_meta.get("session_id", "")).strip() or None,
+            output_session_title=str(output_meta.get("session_title", "")).strip() or None,
+        )
+        if session_event and session_id:
+            await self._emit_session_event(session_event, session_id)
         if not output:
-            return None, "empty", elapsed
-        return output, "ok", elapsed
+            # Broadcast typing stopped
+            if self.room_id:
+                await self.send_command("agent_typing", is_typing=False)
+            return None, "empty", elapsed, "Hermes returned no response text"
 
-    # ------------------------------------------------------------------
-    # Message handler
-    # ------------------------------------------------------------------
+        # Broadcast typing stopped and tool complete
+        if self.room_id:
+            await self.send_command("agent_typing", is_typing=False)
+            await self.send_command(
+                "agent_tool_use", tool_name="hermes", status="completed"
+            )
+
+        return output, "ok", elapsed, ""
+
+    # -----------------------------------------------------------------------
+    # Message handlers
+    # -----------------------------------------------------------------------
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
@@ -204,31 +503,118 @@ class HermesAdapter(BaseAdapter):
         self._responding = True
         try:
             prompt = self._build_prompt(message)
-            response, state, elapsed = await self._call_hermes(prompt)
+            await self.send_status(
+                "responding",
+                f"{self.profile} profile call started (timeout {self.timeout_seconds:.0f}s)",
+            )
+            response, state, elapsed, detail = await self._call_hermes(prompt)
             if state == "ok" and response:
+                logger.info(f"Responding ({len(response)} chars)")
                 await self.send_message(response)
-                logger.info(f"{self.config.name}: responded in {elapsed:.1f}s")
+                message_id = str(message.get("id", "")).strip()
+                if message_id:
+                    self._persist_session_state(last_message_id=message_id)
+            elif state == "timeout":
+                await self.send_status("timeout", detail)
+            elif state == "empty":
+                logger.warning("Hermes returned no response")
+                await self.send_status(
+                    "no_response",
+                    f"{self.profile} profile returned no response after {elapsed:.1f}s",
+                )
             else:
-                logger.warning(f"{self.config.name}: no response ({state}, {elapsed:.1f}s)")
+                await self.send_status(
+                    "error", detail or f"{self.profile} profile call failed"
+                )
         finally:
             self._responding = False
 
+    async def handle_context_dump(self, messages: list):
+        logger.info(f"Context loaded: {len(messages)} historical messages")
+
+    async def handle_approval_request(self, message: dict):
+        req_id = message.get("request_id", "?")
+        command = message.get("command", "?")
+        requester = message.get("requester", "?")
+        logger.info(
+            f"Approval request {req_id}: {requester} wants {command} (awaiting human approval)"
+        )
+
+    async def handle_directive(self, message: dict):
+        if not self._directive_targets_me(message):
+            return
+        directive_id = str(message.get("directive_id", "")).strip()
+        if directive_id:
+            await self.send_command(
+                "ack_directive",
+                directive_id=directive_id,
+                state="accepted",
+            )
+        mention = "@wizard" if self.profile == "wizard" else "@cassette"
+        content = str(message.get("content", "")).strip()
+        refs = message.get("refs", [])
+        if isinstance(refs, list) and refs:
+            content += "\n\nRefs:\n" + "\n".join(f"- {item}" for item in refs if item)
+        synthetic = {
+            "type": "message",
+            "sender": {
+                "id": str(message.get("issued_by_id", "")),
+                "name": str(message.get("issued_by", "human")),
+                "type": str(message.get("issued_by_type", "human")),
+            },
+            "content": f"{mention} directive ({message.get('directive_kind', 'brief')}):\n{content}",
+        }
+        await self.handle_message(synthetic)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Polycule Hermes Adapter")
-    parser.add_argument("--name",    default="Hermes", help="Agent name in chat")
-    parser.add_argument("--profile", default=None,     help="Hermes profile name")
-    parser.add_argument("--room",    default="Main",   help="Room to join")
-    parser.add_argument("--host",    default="localhost")
-    parser.add_argument("--port",    default=7777, type=int)
-    parser.add_argument("--trigger", action="append", dest="triggers", default=[],
-                        help="Trigger word (repeatable). Default: @name and name.")
-    parser.add_argument("--always",  action="store_true", help="Respond to all human messages")
-    parser.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=float,
-                        help=f"Hermes call timeout in seconds (default: {DEFAULT_TIMEOUT:.0f})")
-    parser.add_argument("--system-prompt", default=None,
-                        help="Override the system prompt injected into hermes")
+    parser = argparse.ArgumentParser(description="Hermes adapter for Polycule")
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Display name (default: Wizard for wizard profile, Cassette otherwise)",
+    )
+    parser.add_argument(
+        "--profile",
+        default="cassette",
+        help="Hermes profile: cassette (default) or wizard",
+    )
+    parser.add_argument("--room", default="Default")
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument(
+        "--always",
+        action="store_true",
+        help="Respond to all human messages, not just mentions",
+    )
+    parser.add_argument(
+        "--always-all",
+        action="store_true",
+        help="Respond to all messages (unsafe: can trigger loops)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="SESSION_ID",
+        help="Resume a prior hermes session by ID",
+    )
+    parser.add_argument("--session-title", default=None)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_HERMES_TIMEOUT_SECONDS,
+        help=f"Seconds to wait for hermes response (default: {DEFAULT_HERMES_TIMEOUT_SECONDS:.0f})",
+    )
     args = parser.parse_args()
+
+    # Default names by profile
+    if args.name is None:
+        args.name = "Wizard" if args.profile == "wizard" else "Cassette"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -242,19 +628,11 @@ def main():
         hub_host=args.host,
         hub_port=args.port,
         always_respond=args.always,
-        triggers=args.triggers or None,
-        system_prompt=args.system_prompt,
-        timeout=args.timeout,
+        always_all=args.always_all,
+        resume_session=args.resume,
+        session_title=args.session_title,
+        timeout_seconds=args.timeout,
     )
-
-    if not adapter._hermes_bin:
-        print(
-            "Error: hermes not found. Install hermes and ensure it is on PATH, "
-            "or place it at ~/.hermes/bin/hermes.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     asyncio.run(adapter.run())
 
 

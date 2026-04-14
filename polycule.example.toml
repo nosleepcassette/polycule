@@ -1,6 +1,7 @@
-# polycule.toml — agent configuration
+# polycule.toml — reference agent configuration
 # Copy to polycule.toml and edit to match your setup.
-# Run `polycule init` to generate this automatically.
+# Note: `polycule start` does not read this file yet. This example remains as a
+# reference for manual or future config-driven launches.
 
 [hub]
 host = "localhost"

@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # maps · cassette.help · MIT
 """
-polycule — CLI for the Polycule multi-agent hub.
+polycule — CLI for the Polycule multi-agent tmux workspace.
 
 Commands:
-  init          Interactive setup wizard — creates polycule.toml
-  start         Start hub + TUI (full launch)
+  start         Init layout + start hub + start TUI + start enabled backend agents
   hub           Start just the hub
   tui           Start just the chat TUI
-  agents        Launch all agents from polycule.toml in the background
-  agent         Launch a specific adapter by type (claude, codex, shell)
+  agent         Launch an agent adapter OR manage backend agent cooldown state
   approve       Toggle auto-approve mode (on/off)
   status        Check hub status
 
@@ -19,24 +17,560 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.parent
-SRC_DIR     = PROJECT_DIR / 'src'
+SRC_DIR = PROJECT_DIR / 'src'
+DB_PATH = PROJECT_DIR / 'polycule.db'
 sys.path.insert(0, str(SRC_DIR))
+
+from hermes_sessions import hermes_session_exists
+from runtime_state import (
+    clear_agent_session_entry,
+    get_agent_session_entry,
+    get_or_allocate_agent_session_title,
+    make_agent_session_key,
+    update_agent_session_entry,
+)
+from session_backends import (
+    claude_session_exists,
+    codex_session_exists,
+    gemini_session_exists,
+    newest_claude_session_id,
+    newest_codex_session_id,
+    newest_gemini_session_id,
+    newest_opencode_session_id,
+    opencode_session_exists,
+)
+
+MANAGED_BACKEND_AGENTS = ('cassette', 'wizard', 'codex', 'claude', 'opencode', 'gemini')
+LAUNCHABLE_AGENTS = ('hermes', 'cassette', 'wizard', 'claude', 'codex', 'opencode', 'gemini')
+AGENT_MODE_VALUES = ('mention', 'always', 'off')
+DEFAULT_AGENT_MODES = {
+    'cassette': 'always',
+    'wizard': 'always',
+    'codex': 'always',
+    'claude': 'mention',
+    'opencode': 'mention',
+    'gemini': 'mention',
+}
+CODEX_DISCOVERY_PREFIX = "You are Codex, an AI coding agent participating in the Polycule"
+CLAUDE_DISCOVERY_HINT = (
+    "You are Claude, an AI assistant participating in the Polycule "
+    "multi-agent workspace."
+)
+GEMINI_DISCOVERY_HINT = (
+    "You are Gemini, an AI assistant participating in the Polycule "
+    "multi-agent workspace."
+)
+
+
+def _default_human_name() -> str:
+    return (
+        os.environ.get('POLYCULE_OPERATOR_NAME')
+        or os.environ.get('USER')
+        or os.environ.get('LOGNAME')
+        or 'you'
+    )
+
+
+def _db():
+    from backend.db import PolyculeDB
+
+    return PolyculeDB(db_path=DB_PATH)
+
+
+def _load_disabled_agents() -> set[str]:
+    raw = _db().get_setting('disabled_agents', '[]') or '[]'
+    try:
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            items = []
+    except json.JSONDecodeError:
+        items = []
+    return {str(item).lower() for item in items if str(item).lower() in MANAGED_BACKEND_AGENTS}
+
+
+def _save_disabled_agents(disabled: set[str]):
+    payload = sorted(a for a in disabled if a in MANAGED_BACKEND_AGENTS)
+    _db().set_setting('disabled_agents', json.dumps(payload))
+
+
+def _load_agent_modes() -> dict[str, str]:
+    modes = dict(DEFAULT_AGENT_MODES)
+    raw = _db().get_setting('agent_modes', '') or ''
+    if not raw:
+        return modes
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return modes
+    if not isinstance(parsed, dict):
+        return modes
+    for agent in MANAGED_BACKEND_AGENTS:
+        value = str(parsed.get(agent, '')).strip().lower()
+        if value in AGENT_MODE_VALUES:
+            modes[agent] = value
+    return modes
+
+
+def _save_agent_modes(modes: dict[str, str]):
+    payload = {}
+    for agent in MANAGED_BACKEND_AGENTS:
+        value = str(modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))).strip().lower()
+        payload[agent] = value if value in AGENT_MODE_VALUES else DEFAULT_AGENT_MODES.get(agent, 'mention')
+    _db().set_setting('agent_modes', json.dumps(payload))
+
+
+def _tmux_send(pane_id: str, *keys: str):
+    subprocess.run(['tmux', 'send-keys', '-t', pane_id, *keys], check=False)
+
+
+def _reset_pane(pane_id: str):
+    _tmux_send(pane_id, 'C-c')
+    _tmux_send(pane_id, 'C-c')
+    _tmux_send(pane_id, 'clear', 'Enter')
+
+
+def _run_in_pane(pane_id: str, command: str):
+    _reset_pane(pane_id)
+    _tmux_send(pane_id, command, 'Enter')
+
+
+def _backend_agent_command(agent_name: str, room: str, mode: str = 'mention') -> str:
+    room_q = shlex.quote(room)
+    proj_q = shlex.quote(str(PROJECT_DIR))
+    agent = agent_name.lower()
+    mode = mode.lower().strip()
+
+    if agent == 'cassette':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_hermes_resume_flag('cassette', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('hermes', room, profile='cassette'))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'hermes_adapter.py'))} "
+            f"--name cassette --profile cassette --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    if agent == 'wizard':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_hermes_resume_flag('wizard', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('hermes', room, profile='wizard'))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'hermes_adapter.py'))} "
+            f"--name wizard --profile wizard --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    if agent == 'codex':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_resume_flag('codex', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('codex', room))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'codex_adapter.py'))} "
+            f"--name codex --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    if agent == 'claude':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_resume_flag('claude', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('claude', room))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'claude_adapter.py'))} "
+            f"--name claude --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    if agent == 'opencode':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_resume_flag('opencode', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('opencode', room))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'opencode_adapter.py'))} "
+            f"--name opencode --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    if agent == 'gemini':
+        always_flag = ' --always' if mode == 'always' else ''
+        resume_flag = _managed_resume_flag('gemini', room)
+        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('gemini', room))}"
+        return (
+            f"cd {proj_q} && "
+            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'gemini_adapter.py'))} "
+            f"--name gemini --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        )
+    raise ValueError(f'Unsupported backend agent: {agent_name}')
+
+
+def _disabled_notice_command(agent_name: str) -> str:
+    msg = f"[cooldown] {agent_name} disabled. re-enable with: polycule agent enable {agent_name}"
+    return f"echo {shlex.quote(msg)}"
+
+
+def _mode_off_notice_command(agent_name: str) -> str:
+    msg = f"[mode=off] {agent_name} muted. set mode with: polycule agent mode {agent_name} mention|always"
+    return f"echo {shlex.quote(msg)}"
+
+
+def _unavailable_notice_command(agent_name: str, detail: str) -> str:
+    msg = (
+        f"[unavailable] {agent_name} skipped. {detail}. "
+        f"disable with: polycule agent disable {agent_name}"
+    )
+    return f"echo {shlex.quote(msg)}"
+
+
+def _agent_availability(agent_name: str) -> tuple[bool, str]:
+    agent = agent_name.strip().lower()
+
+    if agent in ('cassette', 'wizard', 'hermes'):
+        hermes_bin = Path.home() / '.hermes' / 'bin' / 'hermes'
+        if hermes_bin.exists():
+            return True, str(hermes_bin)
+        found = shutil.which('hermes')
+        if found:
+            return True, found
+        return False, "requires Hermes CLI (`hermes`)"
+
+    if agent == 'codex':
+        codex_bin = Path('/usr/local/bin/codex')
+        if codex_bin.exists():
+            return True, str(codex_bin)
+        found = shutil.which('codex')
+        if found:
+            return True, found
+        return False, "requires Codex CLI (`codex`)"
+
+    binary_by_agent = {
+        'claude': 'claude',
+        'opencode': 'opencode',
+        'gemini': 'gemini',
+    }
+    binary = binary_by_agent.get(agent)
+    if not binary:
+        return False, f"unknown dependency for {agent_name}"
+    found = shutil.which(binary)
+    if found:
+        return True, found
+    return False, f"requires {binary} CLI (`{binary}`)"
+
+
+def _find_named_panes(label: str) -> list[str]:
+    result = subprocess.run(
+        ['tmux', 'list-panes', '-a', '-F', '#{pane_id}:#{@name}'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+
+    pane_ids = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split(':', 1)
+        if len(parts) != 2:
+            continue
+        pane_id, pane_label = parts[0], parts[1].strip().lower()
+        if pane_label == label.lower():
+            pane_ids.append(pane_id)
+    return pane_ids
+
+
+def _resolve_managed_hermes_session(profile: str, room: str) -> str | None:
+    key = make_agent_session_key('hermes', room, profile=profile)
+    entry = get_agent_session_entry(key)
+    if not entry:
+        return None
+    session_id = str(entry.get('session_id', '')).strip()
+    if not session_id:
+        return None
+    if not hermes_session_exists(profile, session_id):
+        clear_agent_session_entry(key)
+        return None
+    return session_id
+
+
+def _managed_session_key(agent_family: str, room: str, *, profile: str = '') -> str:
+    return make_agent_session_key(agent_family, room, profile=profile)
+
+
+def _ensure_managed_session_title(agent_family: str, room: str, *, profile: str = '') -> str:
+    key = _managed_session_key(agent_family, room, profile=profile)
+    title = get_or_allocate_agent_session_title(key)
+    entry = get_agent_session_entry(key) or {}
+    if str(entry.get('title', '')).strip() == title:
+        return title
+    normalized_profile = profile if profile else agent_family
+    agent_name = profile if profile else agent_family
+    update_agent_session_entry(
+        key,
+        agent_family=agent_family,
+        profile=normalized_profile,
+        room=room,
+        agent_name=agent_name,
+        title=title,
+    )
+    return title
+
+
+def _managed_session_title(agent_name: str, room: str, *, profile: str = '') -> str:
+    agent = agent_name.strip().lower()
+    return _ensure_managed_session_title(agent, room, profile=profile)
+
+
+def _persist_managed_session(
+    agent_family: str,
+    room: str,
+    session_id: str,
+    *,
+    profile: str = '',
+):
+    normalized_profile = profile if profile else agent_family
+    key = make_agent_session_key(agent_family, room, profile=profile)
+    title = _managed_session_title(agent_family, room, profile=profile)
+    agent_name = profile if profile else agent_family
+    update_agent_session_entry(
+        key,
+        agent_family=agent_family,
+        profile=normalized_profile,
+        room=room,
+        agent_name=agent_name,
+        title=title,
+        session_id=session_id,
+    )
+
+
+def _resolve_saved_session(
+    agent_family: str,
+    room: str,
+    *,
+    profile: str = '',
+    exists_fn,
+) -> str | None:
+    key = make_agent_session_key(agent_family, room, profile=profile)
+    entry = get_agent_session_entry(key)
+    if not entry:
+        return None
+    session_id = str(entry.get('session_id', '')).strip()
+    if not session_id:
+        return None
+    if not exists_fn(session_id):
+        clear_agent_session_entry(key)
+        return None
+    return session_id
+
+
+def _resolve_managed_codex_session(room: str) -> str | None:
+    session_id = _resolve_saved_session(
+        'codex',
+        room,
+        exists_fn=codex_session_exists,
+    )
+    if session_id:
+        return session_id
+    session_id = newest_codex_session_id(
+        PROJECT_DIR,
+        title_prefix=CODEX_DISCOVERY_PREFIX,
+    )
+    if session_id:
+        _persist_managed_session('codex', room, session_id)
+    return session_id
+
+
+def _resolve_managed_claude_session(room: str) -> str | None:
+    session_id = _resolve_saved_session(
+        'claude',
+        room,
+        exists_fn=lambda sid: claude_session_exists(PROJECT_DIR, sid),
+    )
+    if session_id:
+        return session_id
+    session_id = newest_claude_session_id(
+        PROJECT_DIR,
+        content_hint=CLAUDE_DISCOVERY_HINT,
+    )
+    if session_id:
+        _persist_managed_session('claude', room, session_id)
+    return session_id
+
+
+def _resolve_managed_opencode_session(room: str) -> str | None:
+    session_title = _managed_session_title('opencode', room)
+    session_id = _resolve_saved_session(
+        'opencode',
+        room,
+        exists_fn=opencode_session_exists,
+    )
+    if session_id:
+        return session_id
+    session_id = newest_opencode_session_id(
+        PROJECT_DIR,
+        title=session_title,
+    )
+    if session_id:
+        _persist_managed_session('opencode', room, session_id)
+    return session_id
+
+
+def _resolve_managed_gemini_session(room: str) -> str | None:
+    session_id = _resolve_saved_session(
+        'gemini',
+        room,
+        exists_fn=lambda sid: gemini_session_exists(PROJECT_DIR, sid),
+    )
+    if session_id:
+        return session_id
+    session_id = newest_gemini_session_id(
+        PROJECT_DIR,
+        content_hint=GEMINI_DISCOVERY_HINT,
+    )
+    if session_id:
+        _persist_managed_session('gemini', room, session_id)
+    return session_id
+
+
+def _resolve_managed_session(agent_name: str, room: str) -> str | None:
+    agent = agent_name.strip().lower()
+    if agent in ('cassette', 'wizard'):
+        return _resolve_managed_hermes_session(agent, room)
+    if agent == 'codex':
+        return _resolve_managed_codex_session(room)
+    if agent == 'claude':
+        return _resolve_managed_claude_session(room)
+    if agent == 'opencode':
+        return _resolve_managed_opencode_session(room)
+    if agent == 'gemini':
+        return _resolve_managed_gemini_session(room)
+    return None
+
+
+def _managed_hermes_resume_flag(profile: str, room: str) -> str:
+    session_id = _resolve_managed_hermes_session(profile, room)
+    if not session_id:
+        return ''
+    return f" --resume {shlex.quote(session_id)}"
+
+
+def _managed_resume_flag(agent_name: str, room: str) -> str:
+    session_id = _resolve_managed_session(agent_name, room)
+    if not session_id:
+        return ''
+    return f" --resume {shlex.quote(session_id)}"
+
+
+def _set_agent_runtime_state(agent_name: str, enabled: bool, room: str, modes: dict[str, str] | None = None):
+    panes = _find_named_panes(agent_name)
+    if not panes:
+        return
+    modes = modes or _load_agent_modes()
+    mode = str(modes.get(agent_name, DEFAULT_AGENT_MODES.get(agent_name, 'mention'))).lower()
+    available, detail = _agent_availability(agent_name)
+    for pane_id in panes:
+        if not enabled:
+            _run_in_pane(pane_id, _disabled_notice_command(agent_name))
+            continue
+        if mode == 'off':
+            _run_in_pane(pane_id, _mode_off_notice_command(agent_name))
+        elif not available:
+            _run_in_pane(pane_id, _unavailable_notice_command(agent_name, detail))
+        else:
+            _run_in_pane(pane_id, _backend_agent_command(agent_name, room, mode=mode))
+
+
+def _set_agent_enabled(agent_name: str, enabled: bool, room: str):
+    disabled = _load_disabled_agents()
+    modes = _load_agent_modes()
+    if enabled:
+        disabled.discard(agent_name)
+    else:
+        disabled.add(agent_name)
+    _save_disabled_agents(disabled)
+    _set_agent_runtime_state(agent_name, enabled=enabled, room=room, modes=modes)
+
+
+def _set_agent_mode(agent_name: str, mode: str, room: str):
+    normalized = mode.strip().lower()
+    if normalized not in AGENT_MODE_VALUES:
+        raise ValueError(f'Invalid mode: {mode}')
+    modes = _load_agent_modes()
+    modes[agent_name] = normalized
+    _save_agent_modes(modes)
+    disabled = _load_disabled_agents()
+    _set_agent_runtime_state(agent_name, enabled=(agent_name not in disabled), room=room, modes=modes)
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_init(args):
-    """Run the interactive setup wizard."""
-    init_script = Path(__file__).parent / 'polycule-init'
-    os.execv(sys.executable, [sys.executable, str(init_script)])
+def cmd_start(args):
+    """Full launch: init session, start hub, start TUI, start enabled backend agents."""
+    from session_init import init
+
+    print("Starting Polycule...")
+    session, panes = init(force_new=args.new)
+
+    hub_pane = panes.get('hub_log')
+    chat_pane = panes.get('chat')
+    disabled = _load_disabled_agents()
+    modes = _load_agent_modes()
+
+    if hub_pane:
+        hub_cmd = f'cd {shlex.quote(str(PROJECT_DIR))} && python3 {shlex.quote(str(SRC_DIR / "backend" / "hub.py"))}'
+        _run_in_pane(hub_pane, hub_cmd)
+        print(f"  Hub starting in pane {hub_pane}")
+    else:
+        print("  Warning: no hub_log pane found; start hub manually: polycule hub")
+
+    if chat_pane:
+        print(f"  Waiting for hub readiness on localhost:7777 (timeout: {args.hub_timeout:.1f}s)")
+        ready = asyncio.run(_wait_for_hub(timeout=args.hub_timeout))
+        if not ready:
+            print(
+                f"  Error: hub not reachable on localhost:7777 after {args.hub_timeout:.1f}s",
+                file=sys.stderr,
+            )
+            print("  TUI not started.", file=sys.stderr)
+            sys.exit(1)
+        tui_cmd = (
+            f'cd {shlex.quote(str(PROJECT_DIR))} && '
+            f'python3 {shlex.quote(str(SRC_DIR / "ui" / "chat_tui.py"))} '
+            f'--name {shlex.quote(args.name)} --room {shlex.quote(args.room)}'
+        )
+        _run_in_pane(chat_pane, tui_cmd)
+        print(f"  TUI starting in pane {chat_pane}")
+    else:
+        print("  Warning: no chat pane found; start TUI manually: polycule tui")
+
+    print("  Backend agents:")
+    for agent in MANAGED_BACKEND_AGENTS:
+        pane_id = panes.get(agent)
+        if not pane_id:
+            print(f"    - {agent}: missing pane")
+            continue
+        mode = modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))
+        if agent in disabled:
+            _run_in_pane(pane_id, _disabled_notice_command(agent))
+            print(f"    - {agent}: disabled (cooldown)")
+            continue
+        if mode == 'off':
+            _run_in_pane(pane_id, _mode_off_notice_command(agent))
+            print(f"    - {agent}: mode off (muted)")
+            continue
+        available, detail = _agent_availability(agent)
+        if not available:
+            _run_in_pane(pane_id, _unavailable_notice_command(agent, detail))
+            print(f"    - {agent}: unavailable, skipped ({detail})")
+            continue
+        _run_in_pane(pane_id, _backend_agent_command(agent, args.room, mode=mode))
+        print(f"    - {agent}: started in {pane_id} (mode={mode})")
+
+    if getattr(args, 'background', False):
+        print(f"\nPolycule running in background — attach with: tmux attach -t {session}:polycule")
+        return
+    print(f"\nAttaching to session: {session}")
+    os.execvp('tmux', ['tmux', 'attach-session', '-t', f'{session}:polycule'])
 
 
 def cmd_hub(args):
@@ -60,118 +594,99 @@ def cmd_tui(args):
     os.execv(sys.executable, [sys.executable, str(tui_py)] + extra)
 
 
-def cmd_start(args):
-    """Start hub + TUI (foreground hub, then TUI in same terminal after hub ready)."""
-    from config import load_config
-    cfg = load_config()
-
-    name = args.name or cfg.tui.default_name
-    room = args.room or cfg.tui.default_room
-    host = args.host or cfg.hub.host
-    port = args.port or cfg.hub.port
-
-    # Start hub in background
-    hub_py = SRC_DIR / 'backend' / 'hub.py'
-    logs_dir = PROJECT_DIR / 'logs'
-    logs_dir.mkdir(exist_ok=True)
-
-    hub_log = open(logs_dir / 'hub.log', 'a')
-    hub_proc = subprocess.Popen(
-        [sys.executable, str(hub_py)],
-        stdout=hub_log, stderr=hub_log,
-    )
-    print(f"Hub started (PID {hub_proc.pid}) → logs/hub.log")
-
-    # Wait for hub to be ready
-    for _ in range(20):
-        time.sleep(0.25)
-        try:
-            import socket
-            s = socket.create_connection((host, port), timeout=0.2)
-            s.close()
-            break
-        except OSError:
-            pass
-    else:
-        print("Warning: hub may not be ready yet")
-
-    # Start TUI (foreground)
-    tui_py = SRC_DIR / 'ui' / 'chat_tui.py'
-    os.execv(sys.executable, [
-        sys.executable, str(tui_py),
-        '--name', name, '--room', room,
-        '--host', host, '--port', str(port),
-    ])
-
-
-def cmd_agents(args):
-    """Launch all enabled agents from polycule.toml as background processes."""
-    from config import load_config
-    cfg = load_config()
-
-    if not cfg.agents:
-        print("No agents configured. Run 'polycule init' or edit polycule.toml.")
-        sys.exit(1)
-
-    logs_dir = PROJECT_DIR / 'logs'
-    logs_dir.mkdir(exist_ok=True)
-
-    for agent in cfg.agents:
-        log_path = logs_dir / f"{agent.name.lower()}.log"
-        log_file = open(log_path, 'a')
-
-        script, extra_args = _agent_script_and_args(agent)
-        cmd = [sys.executable, str(script)] + extra_args
-
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
-        print(f"  {agent.name} (PID {proc.pid}) → logs/{agent.name.lower()}.log")
-
-    print(f"\n{len(cfg.agents)} agent(s) running in background.")
-    print("Logs: logs/<name>.log  |  Stop: pkill -f polycule")
-
-
-def _agent_script_and_args(agent) -> tuple[Path, list[str]]:
-    """Return (script_path, extra_args) for a configured agent."""
-    base = [
-        '--name', agent.name,
-        '--room', agent.room,
-    ]
-    if agent.always:
-        base += ['--always']
-    for t in agent.triggers:
-        base += ['--trigger', t]
-
-    if agent.adapter == 'claude':
-        return SRC_DIR / 'agents' / 'claude_adapter.py', base
-    elif agent.adapter == 'codex':
-        return SRC_DIR / 'agents' / 'codex_adapter.py', base
-    elif agent.adapter == 'hermes':
-        hermes_args = list(base)
-        if agent.profile:
-            hermes_args += ['--profile', agent.profile]
-        if agent.timeout:
-            hermes_args += ['--timeout', str(agent.timeout)]
-        return SRC_DIR / 'agents' / 'hermes_adapter.py', hermes_args
-    elif agent.adapter == 'shell':
-        if not agent.command:
-            raise ValueError(f"Agent {agent.name!r} has adapter=shell but no command")
-        return SRC_DIR / 'agents' / 'shell_adapter.py', base + ['--command', agent.command]
-    else:
-        raise ValueError(f"Unknown adapter type {agent.adapter!r} for agent {agent.name!r}")
-
-
 def cmd_agent(args):
-    """Launch a specific agent adapter."""
+    """Launch adapter OR manage backend agent cooldown state."""
+    action = args.agent_or_action.lower()
+
+    if action in ('enable', 'disable', 'status', 'mode', 'modes'):
+        if action == 'status':
+            disabled = _load_disabled_agents()
+            modes = _load_agent_modes()
+            enabled = [a for a in MANAGED_BACKEND_AGENTS if a not in disabled]
+            print(f"Enabled:  {', '.join(enabled) if enabled else '(none)'}")
+            print(f"Disabled: {', '.join(sorted(disabled)) if disabled else '(none)'}")
+            for agent in MANAGED_BACKEND_AGENTS:
+                state = 'disabled' if agent in disabled else 'enabled'
+                mode = modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))
+                available, detail = _agent_availability(agent)
+                availability = 'available' if available else 'missing'
+                line = f"{agent}: state={state} mode={mode} availability={availability}"
+                if detail:
+                    line += f" detail={detail}"
+                print(line)
+            return
+
+        if action == 'modes':
+            modes = _load_agent_modes()
+            for agent in MANAGED_BACKEND_AGENTS:
+                print(f"{agent}: {modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))}")
+            return
+
+        target = (args.target_agent or '').strip().lower()
+        if target not in MANAGED_BACKEND_AGENTS:
+            print(f"Unknown backend agent: {target or '(missing)'}", file=sys.stderr)
+            print(f"Available: {', '.join(MANAGED_BACKEND_AGENTS)}", file=sys.stderr)
+            sys.exit(1)
+
+        if action == 'mode':
+            mode_value = (args.action_value or '').strip().lower()
+            if mode_value not in AGENT_MODE_VALUES:
+                print(
+                    f"Invalid mode: {mode_value or '(missing)'} "
+                    f"(expected one of: {', '.join(AGENT_MODE_VALUES)})",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            _set_agent_mode(target, mode_value, room=args.room)
+            print(f"Set mode {target}={mode_value}")
+            return
+
+        enabling = action == 'enable'
+        _set_agent_enabled(target, enabled=enabling, room=args.room)
+        print(f"{'Enabled' if enabling else 'Disabled'} {target}")
+        return
+
+    profile_map = {
+        'wizard': ('hermes', 'wizard', 'wizard'),
+        'cassette': ('hermes', 'cassette', 'cassette'),
+        'hermes': ('hermes', 'cassette', 'cassette'),
+    }
     agent_scripts = {
+        'hermes': SRC_DIR / 'agents' / 'hermes_adapter.py',
         'claude': SRC_DIR / 'agents' / 'claude_adapter.py',
-        'codex':  SRC_DIR / 'agents' / 'codex_adapter.py',
-        'shell':  SRC_DIR / 'agents' / 'shell_adapter.py',
+        'codex': SRC_DIR / 'agents' / 'codex_adapter.py',
+        'opencode': SRC_DIR / 'agents' / 'opencode_adapter.py',
+        'gemini': SRC_DIR / 'agents' / 'gemini_adapter.py',
     }
 
-    script = agent_scripts.get(args.agent_type)
-    if not script:
-        print(f"Unknown agent type: {args.agent_type}")
-        print("Available: claude, codex, shell")
+    agent_type = action
+    if agent_type not in LAUNCHABLE_AGENTS:
+        print(f"Unknown agent type/action: {action}")
+        print(f"Launchable agents: {', '.join(LAUNCHABLE_AGENTS)}")
+        print("Cooldown controls: enable <agent>, disable <agent>, status")
+        sys.exit(1)
+
+    script_key = agent_type
+    extra_flags = []
+    selected_profile = None
+
+    if agent_type in profile_map:
+        script_key, profile, default_name = profile_map[agent_type]
+        selected_profile = profile
+        extra_flags += ['--profile', profile]
+        if not args.name:
+            extra_flags += ['--name', default_name]
+
+    agent_py = agent_scripts.get(script_key)
+    if not agent_py:
+        print(f"Unknown agent type: {agent_type}")
+        print("Available: hermes, wizard, cassette, claude, codex, opencode, gemini")
+        sys.exit(1)
+
+    availability_key = selected_profile if script_key == 'hermes' and selected_profile else script_key
+    available, detail = _agent_availability(availability_key)
+    if not available:
+        print(f"Cannot launch {agent_type}: {detail}", file=sys.stderr)
         sys.exit(1)
 
     extra = []
@@ -185,24 +700,35 @@ def cmd_agent(args):
         extra += ['--port', str(args.port)]
     if getattr(args, 'always', False):
         extra += ['--always']
-    if getattr(args, 'command', None):
-        extra += ['--command', args.command]
+    if getattr(args, 'always_all', False):
+        extra += ['--always-all']
+    if script_key != 'hermes':
+        extra += ['--session-title', _ensure_managed_session_title(script_key, args.room)]
+    elif selected_profile:
+        extra += ['--session-title', _ensure_managed_session_title('hermes', args.room, profile=selected_profile)]
+    resolved_resume = getattr(args, 'resume', None)
+    if not resolved_resume:
+        if script_key == 'hermes' and selected_profile:
+            resolved_resume = _resolve_managed_hermes_session(selected_profile, args.room)
+        elif script_key in ('codex', 'claude', 'opencode', 'gemini'):
+            resolved_resume = _resolve_managed_session(script_key, args.room)
+    if resolved_resume:
+        extra += ['--resume', resolved_resume]
 
-    os.execv(sys.executable, [sys.executable, str(script)] + extra)
+    os.execv(sys.executable, [sys.executable, str(agent_py)] + extra_flags + extra)
 
 
 def cmd_approve(args):
-    """Toggle auto-approve mode."""
+    """Toggle auto-approve mode by sending command to hub."""
     value = args.setting.lower() not in ('off', '0', 'false', 'no')
-    asyncio.run(_send_hub_command({
-        'type': 'command', 'command': 'set_auto_approve', 'value': value
-    }))
-    print(f"Auto-approve {'enabled' if value else 'disabled'}")
+    asyncio.run(_send_hub_command({'type': 'command', 'command': 'set_auto_approve', 'value': value}))
+    status = 'enabled' if value else 'disabled'
+    print(f"Auto-approve {status}")
 
 
 def cmd_status(args):
     """Check if hub is reachable."""
-    asyncio.run(_check_status(args.host, args.port))
+    asyncio.run(_check_status())
 
 
 async def _send_hub_command(msg: dict, host: str = 'localhost', port: int = 7777):
@@ -211,13 +737,30 @@ async def _send_hub_command(msg: dict, host: str = 'localhost', port: int = 7777
         handshake = {'type': 'handshake', 'name': 'polycule-cli', 'agent_type': 'human', 'room_name': 'Default'}
         w.write((json.dumps(handshake) + '\n').encode())
         await w.drain()
+
+        def _is_awaiting_room(payload: dict) -> bool:
+            return payload.get('action') == 'awaiting_room'
+
         data = await asyncio.wait_for(r.readline(), timeout=3.0)
-        response = json.loads(data.decode().strip())
-        if response.get('action') == 'awaiting_room':
+        response = json.loads(data.decode().strip() or '{}')
+        if _is_awaiting_room(response):
             join = {'type': 'command', 'command': 'create_room', 'room_name': 'Default'}
             w.write((json.dumps(join) + '\n').encode())
             await w.drain()
             await asyncio.wait_for(r.readline(), timeout=3.0)
+        else:
+            try:
+                data = await asyncio.wait_for(r.readline(), timeout=0.2)
+                if data:
+                    response = json.loads(data.decode().strip() or '{}')
+                    if _is_awaiting_room(response):
+                        join = {'type': 'command', 'command': 'create_room', 'room_name': 'Default'}
+                        w.write((json.dumps(join) + '\n').encode())
+                        await w.drain()
+                        await asyncio.wait_for(r.readline(), timeout=3.0)
+            except asyncio.TimeoutError:
+                pass
+
         w.write((json.dumps(msg) + '\n').encode())
         await w.drain()
         w.close()
@@ -228,13 +771,32 @@ async def _send_hub_command(msg: dict, host: str = 'localhost', port: int = 7777
 
 async def _check_status(host: str = 'localhost', port: int = 7777):
     try:
-        _, w = await asyncio.open_connection(host, port)
+        _r, w = await asyncio.open_connection(host, port)
         w.close()
+        await w.wait_closed()
         print(f"Hub: UP ({host}:{port})")
     except ConnectionRefusedError:
-        print(f"Hub: DOWN (nothing on {host}:{port})")
+        print(f"Hub: DOWN (nothing listening on {host}:{port})")
     except Exception as e:
-        print(f"Hub: ERROR — {e}")
+        print(f"Hub: ERROR - {e}")
+
+
+async def _wait_for_hub(
+    host: str = 'localhost',
+    port: int = 7777,
+    timeout: float = 10.0,
+    interval: float = 0.2,
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            _r, w = await asyncio.open_connection(host, port)
+            w.close()
+            await w.wait_closed()
+            return True
+        except Exception:
+            await asyncio.sleep(interval)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -242,75 +804,90 @@ async def _check_status(host: str = 'localhost', port: int = 7777):
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog='polycule', description='Polycule multi-agent hub CLI')
+    p = argparse.ArgumentParser(
+        prog='polycule',
+        description='Polycule multi-agent workspace CLI',
+    )
     sub = p.add_subparsers(dest='command', metavar='COMMAND')
 
-    sub.add_parser('init', help='Interactive setup wizard')
+    # start
+    s = sub.add_parser('start', help='Full launch: session + hub + TUI + backend agents')
+    s.add_argument('--name', default=_default_human_name())
+    s.add_argument('--room', default='Default')
+    s.add_argument('--new', action='store_true', help='Force new tmux session')
+    s.add_argument('--hub-timeout', type=float, default=10.0, help='Seconds to wait for hub readiness')
+    s.add_argument('--background', action='store_true', help='Start services without attaching to tmux (for launchd/cron)')
 
     # hub
     sub.add_parser('hub', help='Start just the hub')
 
     # tui
     t = sub.add_parser('tui', help='Start just the chat TUI')
-    t.add_argument('--name',              help='Your name in chat')
-    t.add_argument('--room',              help='Room to join')
+    t.add_argument('--name', default=_default_human_name())
+    t.add_argument('--room', default='Default')
     t.add_argument('--host', default='localhost')
     t.add_argument('--port', type=int, default=7777)
 
-    # start
-    s = sub.add_parser('start', help='Start hub + TUI')
-    s.add_argument('--name',              help='Your name in chat')
-    s.add_argument('--room',              help='Room to join')
-    s.add_argument('--host', default='localhost')
-    s.add_argument('--port', type=int, default=None)
-
-    # agents
-    sub.add_parser('agents', help='Launch all configured agents (from polycule.toml)')
-
     # agent
-    a = sub.add_parser('agent', help='Launch a specific adapter')
-    a.add_argument('agent_type', choices=['claude', 'codex', 'shell'], metavar='TYPE')
-    a.add_argument('--name',    default=None)
-    a.add_argument('--room',    default='Main')
-    a.add_argument('--host',    default='localhost')
-    a.add_argument('--port',    type=int, default=7777)
-    a.add_argument('--always',  action='store_true')
-    a.add_argument('--command', default=None, help='Shell command (shell adapter only)')
+    a = sub.add_parser('agent', help='Launch adapter or manage cooldown state')
+    a.add_argument(
+        'agent_or_action',
+        metavar='TYPE|ACTION',
+        help='TYPE: hermes|cassette|wizard|claude|codex|opencode|gemini; ACTION: enable|disable|status|mode|modes',
+    )
+    a.add_argument(
+        'target_agent',
+        nargs='?',
+        metavar='AGENT',
+        help='required for enable/disable/mode: cassette|wizard|codex|claude|opencode|gemini',
+    )
+    a.add_argument(
+        'action_value',
+        nargs='?',
+        metavar='VALUE',
+        help='for mode action: mention|always|off',
+    )
+    a.add_argument('--name', default=None)
+    a.add_argument('--room', default='Default')
+    a.add_argument('--host', default='localhost')
+    a.add_argument('--port', type=int, default=7777)
+    a.add_argument('--always', action='store_true', help='Respond to all messages')
+    a.add_argument('--always-all', action='store_true', help='Respond to all messages including agent output (unsafe)')
+    a.add_argument('--resume', default=None, metavar='SESSION_ID', help='Resume a prior session by ID')
 
     # approve
     ap = sub.add_parser('approve', help='Toggle auto-approve mode')
-    ap.add_argument('setting', choices=['on', 'off'])
+    ap.add_argument('setting', choices=['on', 'off'], help='on | off')
 
     # status
-    st = sub.add_parser('status', help='Check hub status')
-    st.add_argument('--host', default='localhost')
-    st.add_argument('--port', type=int, default=7777)
+    sub.add_parser('status', help='Check hub status')
 
     return p
 
 
 COMMAND_HANDLERS = {
-    'init':    cmd_init,
-    'hub':     cmd_hub,
-    'tui':     cmd_tui,
-    'start':   cmd_start,
-    'agents':  cmd_agents,
-    'agent':   cmd_agent,
+    'start': cmd_start,
+    'hub': cmd_hub,
+    'tui': cmd_tui,
+    'agent': cmd_agent,
     'approve': cmd_approve,
-    'status':  cmd_status,
+    'status': cmd_status,
 }
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
     handler = COMMAND_HANDLERS.get(args.command)
     if not handler:
         parser.print_help()
         sys.exit(1)
+
     handler(args)
 
 

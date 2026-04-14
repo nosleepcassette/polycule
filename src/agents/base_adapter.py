@@ -10,14 +10,22 @@ Each adapter:
 """
 import asyncio
 import json
-import subprocess
 import os
+import subprocess
+import re
+import sys
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_SRC_DIR = str(Path(__file__).resolve().parents[1])
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
+from runtime_state import get_agent_watch_entry
 
 
 @dataclass
@@ -38,8 +46,19 @@ class BaseAdapter:
         self.writer: Optional[asyncio.StreamWriter] = None
         self.room_id: Optional[str] = None
         self.context_messages: List[dict] = []
+        self._seen_message_ids: set[str] = set()
+        self._seen_message_order: List[str] = []
+        self._seen_message_cap = 2000
         self.running = True
         self.log = logging.getLogger(f"polycule.agent.{config.name}")
+        self.watch_scope = "none"
+        self.watch_target = ""
+        self.operator_name = (
+            os.environ.get("POLYCULE_OPERATOR_NAME")
+            or os.environ.get("USER")
+            or "maps"
+        ).strip().lower()
+        self._load_watch_state()
 
     # ------------------------------------------------------------------
     # Connection
@@ -83,8 +102,7 @@ class BaseAdapter:
                 self.room_id = room.get('room_id')
                 # Seed context from room history
                 for msg in room.get('recent_messages', []):
-                    if isinstance(msg, dict) and msg.get('type') == 'message':
-                        self.context_messages.append(msg)
+                    self._append_context_message(msg)
                 self.log.info(
                     f"Connected to room {self.room_id}, "
                     f"loaded {len(self.context_messages)} context messages"
@@ -112,6 +130,25 @@ class BaseAdapter:
             'room_id': self.room_id,
             'content': content,
         }
+        self.writer.write((json.dumps(msg) + '\n').encode())
+        await self.writer.drain()
+
+    async def send_status(self, status: str, detail: Optional[str] = None):
+        """
+        Send an agent status event to the hub.
+
+        Unlike normal chat messages, status events are intended for UI transparency
+        (e.g., responding, timed out, failed) and are relayed as system events.
+        """
+        if not self.writer or not self.room_id:
+            return
+        msg: Dict[str, Any] = {
+            'type': 'status',
+            'room_id': self.room_id,
+            'status': status,
+        }
+        if detail:
+            msg['detail'] = detail
         self.writer.write((json.dumps(msg) + '\n').encode())
         await self.writer.drain()
 
@@ -156,27 +193,124 @@ class BaseAdapter:
         msg_type = msg.get('type')
 
         if msg_type == 'message':
-            self.context_messages.append(msg)
-            if len(self.context_messages) > 200:
-                self.context_messages = self.context_messages[-100:]
-            await self.handle_message(msg)
+            added = self._append_context_message(msg)
+            if added:
+                await self.handle_message(msg)
 
         elif msg_type == 'context_dump':
             msgs = msg.get('messages', [])
-            self.context_messages = msgs + self.context_messages
+            history_to_prepend = []
+            for message in msgs:
+                if self._remember_message_id(message):
+                    history_to_prepend.append(message)
+            self.context_messages = history_to_prepend + self.context_messages
             if len(self.context_messages) > 300:
                 self.context_messages = self.context_messages[-200:]
-            self.log.info(f"Context dump: received {len(msgs)} historical messages")
-            await self.handle_context_dump(msgs)
+            self.log.info(
+                "Context dump: received %s historical messages (%s new)",
+                len(msgs),
+                len(history_to_prepend),
+            )
+            await self.handle_context_dump(history_to_prepend)
 
         elif msg_type == 'system':
             await self.handle_system(msg)
+
+        elif msg_type == 'directive':
+            await self.handle_directive(msg)
 
         elif msg_type == 'approval_request':
             await self.handle_approval_request(msg)
 
         elif msg_type == 'error':
             self.log.warning(f"Hub error: {msg.get('message')}")
+
+    # ------------------------------------------------------------------
+    # Message tracking / trigger helpers
+    # ------------------------------------------------------------------
+
+    def _load_watch_state(self):
+        entry = get_agent_watch_entry(self.config.name, self.config.room_name)
+        if not entry:
+            return
+        self._set_watch_state(entry.get("scope", "none"), entry.get("target", ""))
+
+    def _set_watch_state(self, scope: str, target: str = ""):
+        normalized_scope = " ".join(str(scope or "").split()).strip().lower() or "none"
+        normalized_target = " ".join(str(target or "").split()).strip().lower()
+        if normalized_scope in ("off", "clear"):
+            normalized_scope = "none"
+            normalized_target = ""
+        self.watch_scope = normalized_scope
+        self.watch_target = normalized_target
+
+    def _watch_matches_message(self, message: dict) -> bool:
+        """
+        Phase 1 watch policy:
+        - `human` / `maps`: respond to direct human input from the operator without needing a mention
+        - `room`: respond to human room traffic without needing a mention
+        - `agent:<name>` is tracked and persisted, but remains observe-only for now
+        """
+        sender = message.get("sender", {})
+        sender_type = str(sender.get("type", "")).lower()
+        sender_name = str(sender.get("name", "")).lower()
+
+        if self.watch_scope in ("maps", "human"):
+            return sender_type == "human" and sender_name == self.operator_name
+        if self.watch_scope == "room":
+            return sender_type == "human"
+        return False
+
+    def _directive_targets_me(self, directive: dict) -> bool:
+        targets = directive.get("targets", [])
+        if not isinstance(targets, list):
+            return False
+        normalized_name = self.config.name.strip().lower()
+        return any(str(item).strip().lower() == normalized_name for item in targets)
+
+    def _remember_message_id(self, message: dict) -> bool:
+        """Track message IDs; return False when this message was already seen."""
+        if not isinstance(message, dict):
+            return False
+        msg_id = message.get('id')
+        if not msg_id:
+            return True
+        if msg_id in self._seen_message_ids:
+            return False
+        self._seen_message_ids.add(msg_id)
+        self._seen_message_order.append(msg_id)
+        if len(self._seen_message_order) > self._seen_message_cap:
+            old = self._seen_message_order.pop(0)
+            self._seen_message_ids.discard(old)
+        return True
+
+    def _append_context_message(self, message: dict) -> bool:
+        if not isinstance(message, dict) or message.get('type') != 'message':
+            return False
+        if not self._remember_message_id(message):
+            return False
+        self.context_messages.append(message)
+        if len(self.context_messages) > 200:
+            self.context_messages = self.context_messages[-100:]
+        return True
+
+    @staticmethod
+    def has_any_trigger(content: str, triggers: set[str] | frozenset[str]) -> bool:
+        """
+        Trigger matching rules:
+        - @mentions match by substring (e.g. '@codex')
+        - bare words match token boundaries
+        """
+        lowered = content.lower()
+        for trigger in triggers:
+            token = trigger.lower()
+            if token.startswith('@'):
+                if token in lowered:
+                    return True
+                continue
+            if re.search(rf'(?<![\w@]){re.escape(token)}(?![\w])', lowered):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Overridable hooks
@@ -198,6 +332,18 @@ class BaseAdapter:
             self.log.info(f"Agent joined: {agent.get('name')}")
         elif action == 'agent_left':
             self.log.info(f"Agent left: {message.get('agent_id', '?')}")
+        elif action == 'watch_changed':
+            watcher = str(message.get("watcher", "")).strip().lower()
+            if watcher == self.config.name.strip().lower():
+                self._set_watch_state(
+                    str(message.get("scope", "none")),
+                    str(message.get("target", "")),
+                )
+                self.log.info(
+                    "Watch changed: %s %s",
+                    self.watch_scope,
+                    self.watch_target,
+                )
 
     async def handle_approval_request(self, message: dict):
         """Called when hub requests approval for a structural command."""
@@ -205,6 +351,15 @@ class BaseAdapter:
             f"Approval request {message.get('request_id')}: "
             f"{message.get('command')} from {message.get('requester')}"
         )
+
+    async def handle_directive(self, message: dict):
+        """Called when the hub emits a targeted directive."""
+        if self._directive_targets_me(message):
+            self.log.info(
+                "Directive %s (%s) received",
+                message.get("directive_id", "?"),
+                message.get("directive_kind", "directive"),
+            )
 
     # ------------------------------------------------------------------
     # Cleanup

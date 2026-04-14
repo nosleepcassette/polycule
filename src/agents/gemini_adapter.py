@@ -1,20 +1,18 @@
 # maps · cassette.help · MIT
 """
-Codex Adapter for Polycule Hub
+Gemini CLI Adapter for Polycule Hub
 
-Codex is a TUI REPL with a non-interactive execution mode:
-    codex exec "prompt"
-    codex exec resume SESSION_ID "prompt"
-
-This adapter calls Codex once per relevant message while persisting and
-reusing the underlying Codex session between turns.
+This adapter uses Gemini CLI's non-interactive prompt mode while persisting
+and reusing the underlying Gemini session between turns.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -29,43 +27,45 @@ from runtime_state import (
     normalize_session_title,
     update_agent_session_entry,
 )
-from session_backends import codex_session_exists, newest_codex_session_id, snapshot_codex_sessions
+from session_backends import (
+    gemini_session_exists,
+    newest_gemini_session_id,
+    snapshot_gemini_sessions,
+)
 
 logger = logging.getLogger(__name__)
 
-# Call the real codex binary, not the shell wrapper (avoids post-run hooks)
-CODEX_BIN = Path("/usr/local/bin/codex")
-CODEX_FALLBACK = "codex"
+GEMINI_BIN = "gemini"
 BOOTSTRAP_CONTEXT_LIMIT = 40
 RESUME_FALLBACK_CONTEXT_LIMIT = 12
-CODEX_DISCOVERY_PREFIX = "You are Codex, an AI coding agent participating in the Polycule"
 
-MENTION_TRIGGERS = frozenset({"@codex"})
-HUMAN_WORD_TRIGGERS = frozenset({"codex"})
+MENTION_TRIGGERS = frozenset({"@gemini"})
+HUMAN_WORD_TRIGGERS = frozenset({"gemini"})
 
-SYSTEM_PROMPT = """You are Codex, an AI coding agent participating in the Polycule \
-multi-agent workspace. You specialize in code generation, debugging, and technical \
-implementation. Respond to messages directed at you. Be concise and technical. \
-When providing code, wrap it in appropriate fences."""
+SYSTEM_PROMPT = """You are Gemini, an AI assistant participating in the Polycule \
+multi-agent workspace. You are collaborating with the human operator, Cassette, Wizard, \
+Codex, Claude, and other agents as needed. Be concise, direct, and technically precise. \
+Respond only when addressed or when your input is clearly requested."""
 
 
-class CodexAdapter(BaseAdapter):
-    """Codex non-interactive adapter using `codex exec`."""
+class GeminiAdapter(BaseAdapter):
+    """Gemini CLI adapter using `gemini -p`."""
 
     def __init__(
         self,
-        name: str = "Codex",
+        name: str = "Gemini",
         room: str = "Default",
         hub_host: str = "localhost",
         hub_port: int = 7777,
         always_respond: bool = False,
         always_all: bool = False,
+        model: str = "gemini-2.5-flash",
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
     ):
         config = AgentConfig(
             name=name,
-            agent_type="codex",
+            agent_type="gemini",
             room_name=room,
             hub_host=hub_host,
             hub_port=hub_port,
@@ -73,23 +73,27 @@ class CodexAdapter(BaseAdapter):
         super().__init__(config)
         self.always_respond = always_respond
         self.always_all = always_all
+        self.model = model
         self.resume_session = resume_session
+        self.session_title = normalize_session_title(session_title)
         self._responding = False
         self._cwd = str(Path.cwd().resolve())
-        self.session_key = make_agent_session_key("codex", room)
-        self.session_title = normalize_session_title(session_title)
+        self.session_key = make_agent_session_key("gemini", room)
         self.last_acknowledged_message_id = ""
         self._last_session_event_id = self.resume_session
 
-        self._bin = str(CODEX_BIN) if CODEX_BIN.exists() else CODEX_FALLBACK
         self._load_saved_session_state()
         if not self.session_title or self.session_title.lower().startswith("polycule:"):
             self.session_title = get_or_allocate_agent_session_title(self.session_key)
 
     def _build_cmd(self, prompt: str) -> list[str]:
+        cmd = [GEMINI_BIN]
+        if self.model:
+            cmd.extend(["-m", self.model])
         if self.resume_session:
-            return [self._bin, "exec", "resume", self.resume_session, prompt]
-        return [self._bin, "exec", prompt]
+            cmd.extend(["-r", self.resume_session])
+        cmd.extend(["-p", prompt, "-o", "json"])
+        return cmd
 
     def _load_saved_session_state(self):
         entry = get_agent_session_entry(self.session_key)
@@ -97,7 +101,7 @@ class CodexAdapter(BaseAdapter):
             return
 
         stored_session_id = str(entry.get("session_id", "")).strip()
-        if stored_session_id and not codex_session_exists(stored_session_id):
+        if stored_session_id and not gemini_session_exists(self._cwd, stored_session_id):
             clear_agent_session_entry(self.session_key)
             return
 
@@ -118,8 +122,8 @@ class CodexAdapter(BaseAdapter):
     ):
         update_agent_session_entry(
             self.session_key,
-            agent_family="codex",
-            profile="codex",
+            agent_family="gemini",
+            profile="gemini",
             room=self.config.room_name,
             agent_name=self.config.name,
             title=self.session_title,
@@ -132,23 +136,25 @@ class CodexAdapter(BaseAdapter):
     def _capture_session_id(
         self,
         session_snapshot: Optional[dict[str, int]],
+        *,
+        output_session_id: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         previous_session_id = self.resume_session
-        detected_session_id = (self.resume_session or "").strip()
+        detected_session_id = str(output_session_id or self.resume_session or "").strip()
         if not detected_session_id:
             detected_session_id = (
-                newest_codex_session_id(
+                newest_gemini_session_id(
                     self._cwd,
                     changed_since=session_snapshot,
-                    title_prefix=CODEX_DISCOVERY_PREFIX,
+                    content_hint=SYSTEM_PROMPT,
                 )
                 or ""
             )
         if not detected_session_id:
             detected_session_id = (
-                newest_codex_session_id(
+                newest_gemini_session_id(
                     self._cwd,
-                    title_prefix=CODEX_DISCOVERY_PREFIX,
+                    content_hint=SYSTEM_PROMPT,
                 )
                 or ""
             )
@@ -231,7 +237,7 @@ class CodexAdapter(BaseAdapter):
         if self._responding:
             return False
         sender = message.get("sender", {})
-        if sender.get("type") == "codex":
+        if sender.get("type") == "gemini":
             return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
@@ -249,10 +255,45 @@ class CodexAdapter(BaseAdapter):
             return self.has_any_trigger(content, MENTION_TRIGGERS | HUMAN_WORD_TRIGGERS)
         return self.has_any_trigger(content, MENTION_TRIGGERS)
 
-    async def _call_codex(self, prompt: str) -> Optional[str]:
+    async def _call_gemini(self, prompt: str) -> tuple[Optional[str], Optional[str]]:
         cmd = self._build_cmd(prompt)
-        logger.info("Calling codex exec (%s char prompt)", len(prompt))
-        return await self.run_subprocess(cmd, timeout=120.0)
+        logger.info("Calling gemini -p (%s chars)", len(prompt))
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120.0,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Gemini subprocess timed out after 120s")
+            return None, None
+        except Exception as exc:
+            logger.warning("Gemini subprocess failed: %s", exc)
+            return None, None
+
+        stdout = (result.stdout or "").strip()
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            logger.warning(
+                "Gemini exited %s: %s",
+                result.returncode,
+                (stderr or stdout or "no stderr")[:200],
+            )
+            return None, None
+
+        if not stdout:
+            return None, None
+
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return stdout, None
+
+        response = str(payload.get("response", "")).strip()
+        session_id = str(payload.get("session_id", "")).strip() or None
+        return (response or None), session_id
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
@@ -261,29 +302,31 @@ class CodexAdapter(BaseAdapter):
         self._responding = True
         session_snapshot = None
         if not self.resume_session:
-            session_snapshot = snapshot_codex_sessions(
+            session_snapshot = snapshot_gemini_sessions(
                 self._cwd,
-                title_prefix=CODEX_DISCOVERY_PREFIX,
+                content_hint=SYSTEM_PROMPT,
             )
         try:
             prompt = self._build_prompt(message)
-            response = await self._call_codex(prompt)
+            response, output_session_id = await self._call_gemini(prompt)
+            session_id, session_event = self._capture_session_id(
+                session_snapshot,
+                output_session_id=output_session_id,
+            )
+            if session_event and session_id:
+                await self._emit_session_event(session_event, session_id)
             if response:
-                session_id, session_event = self._capture_session_id(session_snapshot)
-                if session_event and session_id:
-                    await self._emit_session_event(session_event, session_id)
-                logger.info("Responding (%s chars)", len(response))
                 await self.send_message(response)
                 message_id = str(message.get("id", "")).strip()
                 if message_id:
                     self._persist_session_state(last_message_id=message_id)
             else:
-                logger.warning("Codex returned no response")
+                logger.warning("Gemini returned no response")
         finally:
             self._responding = False
 
     async def handle_context_dump(self, messages: list):
-        logger.info("Codex context loaded: %s historical messages", len(messages))
+        logger.info("Gemini context loaded: %s messages", len(messages))
 
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
@@ -306,48 +349,46 @@ class CodexAdapter(BaseAdapter):
                 "name": str(message.get("issued_by", "human")),
                 "type": str(message.get("issued_by_type", "human")),
             },
-            "content": f"@codex directive ({message.get('directive_kind', 'brief')}):\n{content}",
+            "content": f"@gemini directive ({message.get('directive_kind', 'brief')}):\n{content}",
         }
         await self.handle_message(synthetic)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Codex adapter for Polycule")
-    parser.add_argument("--name", default="Codex")
+    parser = argparse.ArgumentParser(description="Gemini adapter for Polycule")
+    parser.add_argument("--name", default="Gemini")
     parser.add_argument("--room", default="Default")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=7777)
-    parser.add_argument(
-        "--always",
-        action="store_true",
-        help="Respond to all human messages",
-    )
+    parser.add_argument("--always", action="store_true")
     parser.add_argument(
         "--always-all",
         action="store_true",
         help="Respond to all messages (unsafe: can trigger loops)",
     )
+    parser.add_argument("--model", default="gemini-2.5-flash")
     parser.add_argument("--session-title", default=None)
     parser.add_argument(
         "--resume",
         default=None,
         metavar="SESSION_ID",
-        help="Resume a prior codex session by ID",
+        help="Resume a prior Gemini session by ID",
     )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
-        format="[%(asctime)s] [codex/%(levelname)s] %(message)s",
+        format="[%(asctime)s] [gemini/%(levelname)s] %(message)s",
     )
 
-    adapter = CodexAdapter(
+    adapter = GeminiAdapter(
         name=args.name,
         room=args.room,
         hub_host=args.host,
         hub_port=args.port,
         always_respond=args.always,
         always_all=args.always_all,
+        model=args.model,
         session_title=args.session_title,
         resume_session=args.resume,
     )

@@ -14,7 +14,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path.home() / 'dev' / 'polycule' / 'polycule.db'
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / 'polycule.db'
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rooms (

@@ -1,7 +1,7 @@
 # polycule
 
-![Polycule Screenshot 1](screenshot.png)
-![Polycule Screenshot 2](screenshot2.png)
+![Polycule Screenshot 1](screen1.png)
+![Polycule Screenshot 2](screen2.png)
 
 Polycule is a local multi-agent chat workspace for terminal AI CLIs. It gives you one shared room, one IRC-style TUI, one local hub, and a tmux layout for keeping multiple agents available at once.
 

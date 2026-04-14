@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,11 @@ SYSTEM_PROMPT = """You are Claude, an AI assistant participating in the Polycule
 multi-agent workspace. You are collaborating with the human operator, Wizard (a Hermes agent), \
 and potentially Codex. Be helpful, concise, and direct. Respond only to messages \
 directed at you or when your input is clearly needed."""
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ClaudeAdapter(BaseAdapter):
@@ -81,6 +87,19 @@ class ClaudeAdapter(BaseAdapter):
 
     def _build_cmd(self, prompt: str) -> list[str]:
         cmd = ["claude", "-p", "--model", self.model]
+        if _env_truthy("POLYCULE_CLAUDE_BYPASS_PERMISSIONS"):
+            cmd.extend(
+                [
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                    os.environ.get("POLYCULE_CLAUDE_PERMISSION_MODE", "bypassPermissions"),
+                    "--allowedTools",
+                    os.environ.get(
+                        "POLYCULE_CLAUDE_ALLOWED_TOOLS",
+                        "Bash,Read,Write,Edit",
+                    ),
+                ]
+            )
         if self.resume_session:
             cmd.extend(["-r", self.resume_session])
         else:

@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -37,6 +38,35 @@ class AgentResumeAdapterTests(unittest.TestCase):
             adapter._build_cmd("ping"),
         )
 
+    def test_codex_resume_command_shape_with_private_env_flags(self):
+        with (
+            patch("agents.codex_adapter.get_agent_session_entry", return_value=None),
+            patch.dict(
+                "agents.codex_adapter.os.environ",
+                {
+                    "POLYCULE_CODEX_DANGEROUS_BYPASS": "1",
+                    "POLYCULE_CODEX_ADD_DIRS": "~/.hermes:~/.codex",
+                },
+                clear=False,
+            ),
+        ):
+            adapter = CodexAdapter(name="codex", room="Default", resume_session="sess-1")
+            self.assertEqual(
+                [
+                    adapter._bin,
+                    "exec",
+                    "resume",
+                    "sess-1",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--add-dir",
+                    os.path.expanduser("~/.hermes"),
+                    "--add-dir",
+                    os.path.expanduser("~/.codex"),
+                    "ping",
+                ],
+                adapter._build_cmd("ping"),
+            )
+
     @patch("agents.claude_adapter.get_agent_session_entry")
     @patch("agents.claude_adapter.claude_session_exists")
     def test_claude_init_loads_saved_session(self, mock_exists, mock_entry):
@@ -58,6 +88,38 @@ class AgentResumeAdapterTests(unittest.TestCase):
             ["claude", "-p", "--model", adapter.model, "-r", "sess-2", "ping"],
             adapter._build_cmd("ping"),
         )
+
+    def test_claude_resume_command_shape_with_private_env_flags(self):
+        with (
+            patch("agents.claude_adapter.get_agent_session_entry", return_value=None),
+            patch.dict(
+                "agents.claude_adapter.os.environ",
+                {
+                    "POLYCULE_CLAUDE_BYPASS_PERMISSIONS": "1",
+                    "POLYCULE_CLAUDE_PERMISSION_MODE": "bypassPermissions",
+                    "POLYCULE_CLAUDE_ALLOWED_TOOLS": "Bash,Read,Write,Edit",
+                },
+                clear=False,
+            ),
+        ):
+            adapter = ClaudeAdapter(name="claude", room="Default", resume_session="sess-2")
+            self.assertEqual(
+                [
+                    "claude",
+                    "-p",
+                    "--model",
+                    adapter.model,
+                    "--dangerously-skip-permissions",
+                    "--permission-mode",
+                    "bypassPermissions",
+                    "--allowedTools",
+                    "Bash,Read,Write,Edit",
+                    "-r",
+                    "sess-2",
+                    "ping",
+                ],
+                adapter._build_cmd("ping"),
+            )
 
     @patch("agents.opencode_adapter.get_agent_session_entry")
     @patch("agents.opencode_adapter.opencode_session_exists")
@@ -99,7 +161,7 @@ class AgentResumeAdapterTests(unittest.TestCase):
         with patch("agents.gemini_adapter.get_agent_session_entry", return_value=None):
             adapter = GeminiAdapter(name="gemini", room="Default", resume_session="sess-4")
         self.assertEqual(
-            ["gemini", "-m", adapter.model, "-r", "sess-4", "-p", "ping", "-o", "json"],
+            ["gemini", "-y", "-m", adapter.model, "-r", "sess-4", "-p", "ping", "-o", "json"],
             adapter._build_cmd("ping"),
         )
 

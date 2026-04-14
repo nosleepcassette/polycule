@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,23 @@ SYSTEM_PROMPT = """You are Codex, an AI coding agent participating in the Polycu
 multi-agent workspace. You specialize in code generation, debugging, and technical \
 implementation. Respond to messages directed at you. Be concise and technical. \
 When providing code, wrap it in appropriate fences."""
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_path_list(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return []
+    items = []
+    for part in raw.split(os.pathsep):
+        expanded = os.path.expanduser(part.strip())
+        if expanded:
+            items.append(expanded)
+    return items
 
 
 class CodexAdapter(BaseAdapter):
@@ -87,9 +105,15 @@ class CodexAdapter(BaseAdapter):
             self.session_title = get_or_allocate_agent_session_title(self.session_key)
 
     def _build_cmd(self, prompt: str) -> list[str]:
+        cmd = [self._bin, "exec"]
         if self.resume_session:
-            return [self._bin, "exec", "resume", self.resume_session, prompt]
-        return [self._bin, "exec", prompt]
+            cmd.extend(["resume", self.resume_session])
+        if _env_truthy("POLYCULE_CODEX_DANGEROUS_BYPASS"):
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        for extra_dir in _env_path_list("POLYCULE_CODEX_ADD_DIRS"):
+            cmd.extend(["--add-dir", extra_dir])
+        cmd.append(prompt)
+        return cmd
 
     def _load_saved_session_state(self):
         entry = get_agent_session_entry(self.session_key)

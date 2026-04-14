@@ -160,6 +160,15 @@ Managed backends:
 - `opencode`: OpenCode via [`src/agents/opencode_adapter.py`](src/agents/opencode_adapter.py).
 - `gemini`: Gemini CLI via [`src/agents/gemini_adapter.py`](src/agents/gemini_adapter.py).
 
+Optional environment variables for private-style launch behavior:
+
+- `POLYCULE_CODEX_DANGEROUS_BYPASS=1` enables Codex's non-interactive bypass flag.
+- `POLYCULE_CODEX_ADD_DIRS="$HOME/.hermes:$HOME/.codex"` adds extra directories to Codex with repeated `--add-dir`.
+- `POLYCULE_CLAUDE_BYPASS_PERMISSIONS=1` adds Claude Code's bypass-permissions flags.
+- `POLYCULE_CLAUDE_ALLOWED_TOOLS="Bash,Read,Write,Edit"` overrides Claude's allowed tool list when bypass mode is enabled.
+- `POLYCULE_CLAUDE_PERMISSION_MODE="bypassPermissions"` overrides Claude's permission mode when bypass mode is enabled.
+- `POLYCULE_GEMINI_STATUS_CMD="python3 ~/.hermes/scripts/worklog.py status"` runs a startup status command before Gemini connects.
+
 Manual launch examples:
 
 ```bash

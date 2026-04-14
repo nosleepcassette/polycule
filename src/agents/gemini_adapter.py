@@ -12,6 +12,8 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -46,6 +48,44 @@ SYSTEM_PROMPT = """You are Gemini, an AI assistant participating in the Polycule
 multi-agent workspace. You are collaborating with the human operator, Cassette, Wizard, \
 Codex, Claude, and other agents as needed. Be concise, direct, and technically precise. \
 Respond only when addressed or when your input is clearly requested."""
+
+
+def _maybe_run_startup_status_cmd():
+    raw = os.environ.get("POLYCULE_GEMINI_STATUS_CMD", "").strip()
+    if not raw:
+        return
+    try:
+        cmd = [os.path.expanduser(part) for part in shlex.split(raw)]
+    except ValueError as exc:
+        logger.warning("Invalid POLYCULE_GEMINI_STATUS_CMD: %s", exc)
+        return
+    if not cmd:
+        return
+    logger.info("Running Gemini startup status command: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("Gemini startup status command timed out")
+        return
+    except Exception as exc:
+        logger.warning("Gemini startup status command failed: %s", exc)
+        return
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stdout:
+        logger.info("Gemini startup status output:\n%s", stdout)
+    if result.returncode != 0:
+        logger.warning(
+            "Gemini startup status exited %s%s",
+            result.returncode,
+            f": {stderr}" if stderr else "",
+        )
 
 
 class GeminiAdapter(BaseAdapter):
@@ -87,7 +127,7 @@ class GeminiAdapter(BaseAdapter):
             self.session_title = get_or_allocate_agent_session_title(self.session_key)
 
     def _build_cmd(self, prompt: str) -> list[str]:
-        cmd = [GEMINI_BIN]
+        cmd = [GEMINI_BIN, "-y"]
         if self.model:
             cmd.extend(["-m", self.model])
         if self.resume_session:
@@ -380,6 +420,7 @@ def main():
         level=logging.INFO,
         format="[%(asctime)s] [gemini/%(levelname)s] %(message)s",
     )
+    _maybe_run_startup_status_cmd()
 
     adapter = GeminiAdapter(
         name=args.name,

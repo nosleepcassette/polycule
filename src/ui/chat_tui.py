@@ -35,6 +35,13 @@ from runtime_state import (
     get_temporary_agent_enablements,
     mark_temporary_agent_enablements,
 )
+from managed_agents import (
+    get_agent_capability_hints,
+    get_default_backend_agent_modes,
+    get_free_agent_names,
+    get_managed_agent_names,
+    get_paid_agent_names,
+)
 
 logger = logging.getLogger(__name__)
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -46,118 +53,32 @@ DEFAULT_HUMAN_NAME = (
     or os.environ.get("LOGNAME")
     or "you"
 )
-BACKEND_AGENTS = ("cassette", "wizard", "codex", "claude", "opencode", "gemini")
-BACKEND_AGENT_SET = set(BACKEND_AGENTS)
 AGENT_MODES = ("mention", "always", "off")
-DEFAULT_BACKEND_AGENT_MODES = {
-    "cassette": "always",
-    "wizard": "always",
-    "codex": "always",
-    "claude": "mention",
-    "opencode": "mention",
-    "gemini": "mention",
-}
-
-FREE_AGENTS = frozenset(("cassette", "wizard", "opencode"))  # free (no API cost)
-PAID_AGENTS = frozenset(("codex", "claude", "gemini"))  # cost money
 
 FREE_MODE_COMMANDS = frozenset(("free", "free-mode"))
 
+def _backend_agents() -> tuple[str, ...]:
+    return tuple(get_managed_agent_names())
+
+
+def _backend_agent_set() -> set[str]:
+    return set(_backend_agents())
+
+
 def DEFAULT_AGENT_MODE(agent_name: str) -> str:
-    return DEFAULT_BACKEND_AGENT_MODES.get(agent_name.strip().lower(), "mention")
+    return get_default_backend_agent_modes().get(agent_name.strip().lower(), "mention")
 
 
-AGENT_CAPABILITY_HINTS = {
-    "cassette": {
-        "summary": "free Hermes operator for shell, tmux, and quick ops",
-        "keywords": {
-            "tmux": 5,
-            "pane": 5,
-            "window": 4,
-            "layout": 4,
-            "shell": 4,
-            "terminal": 4,
-            "session": 3,
-            "ops": 3,
-            "log": 2,
-            "agent": 2,
-        },
-    },
-    "wizard": {
-        "summary": "free Hermes generalist for planning, triage, and docs",
-        "keywords": {
-            "plan": 5,
-            "spec": 5,
-            "design": 4,
-            "triage": 4,
-            "analyze": 4,
-            "analysis": 4,
-            "investigate": 4,
-            "research": 3,
-            "docs": 3,
-            "workflow": 2,
-        },
-    },
-    "codex": {
-        "summary": "strongest implementation path for code changes and tests",
-        "keywords": {
-            "code": 5,
-            "implement": 5,
-            "patch": 5,
-            "fix": 4,
-            "bug": 4,
-            "debug": 4,
-            "refactor": 4,
-            "test": 4,
-            "python": 4,
-            "typescript": 4,
-            "build": 3,
-        },
-    },
-    "claude": {
-        "summary": "best for reviews, writing, architecture, and synthesis",
-        "keywords": {
-            "review": 5,
-            "docs": 4,
-            "write": 4,
-            "architecture": 4,
-            "explain": 4,
-            "analysis": 4,
-            "policy": 3,
-            "summarize": 3,
-            "plan": 3,
-            "design": 3,
-        },
-    },
-    "opencode": {
-        "summary": "coding backup path when you want another code-focused agent",
-        "keywords": {
-            "code": 4,
-            "implement": 4,
-            "patch": 4,
-            "fix": 3,
-            "debug": 3,
-            "test": 3,
-            "backup": 2,
-            "alternate": 2,
-        },
-    },
-    "gemini": {
-        "summary": "broad reasoning and research/synthesis backup with Gemini CLI",
-        "keywords": {
-            "research": 4,
-            "analysis": 4,
-            "explain": 4,
-            "docs": 3,
-            "synthesis": 3,
-            "plan": 3,
-            "design": 3,
-            "review": 3,
-            "google": 2,
-            "backup": 2,
-        },
-    },
-}
+def _free_agents() -> frozenset[str]:
+    return frozenset(get_free_agent_names())
+
+
+def _paid_agents() -> frozenset[str]:
+    return frozenset(get_paid_agent_names())
+
+
+def _agent_capability_hints() -> dict[str, dict[str, object]]:
+    return get_agent_capability_hints()
 
 SLASH_COMMANDS = (
     "help",
@@ -208,7 +129,7 @@ SLASH_HELP = [
     ("/enable <agent>", "reactivate backend agent"),
     ("/mode <agent> <mention|always|off>", "set backend agent response mode"),
     ("/modes", "show backend agent response modes"),
-    ("/free", "toggle free mode (free agents only)"),
+    ("/free", "toggle local/non-premium mode"),
     ("/free-mode", "alias for /free"),
     ("/which <task>", "query agents for best fit"),
     ("/theme <name>", "set color theme"),
@@ -1199,21 +1120,21 @@ class ChatTUI:
         space_if_single = False
 
         if command in ("enable", "disable") and arg_index == 1:
-            pool = list(BACKEND_AGENTS)
+            pool = list(_backend_agents())
         elif command in ("summon", "standdown", "brief") and arg_index >= 1:
-            pool = ["all"] + list(BACKEND_AGENTS)
+            pool = ["all"] + list(_backend_agents())
         elif command == "mode":
             if arg_index == 1:
-                pool = list(BACKEND_AGENTS)
+                pool = list(_backend_agents())
                 space_if_single = True
             elif arg_index == 2:
                 pool = list(AGENT_MODES)
         elif command == "watch":
             if arg_index == 1:
-                pool = ["all"] + list(BACKEND_AGENTS)
+                pool = ["all"] + list(_backend_agents())
                 space_if_single = True
             elif arg_index == 2:
-                pool = ["off", "human", "room"] + [f"@{name}" for name in BACKEND_AGENTS]
+                pool = ["off", "human", "room"] + [f"@{name}" for name in _backend_agents()]
         elif command == "theme" and arg_index == 1:
             pool = list(THEMES.keys()) + ["phosphor"]
         elif command in ("autoapprove", "aa") and arg_index == 1:
@@ -1502,8 +1423,8 @@ class ChatTUI:
         return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
 
     async def _run_agent_control(self, action: str, agent: str):
-        if agent not in BACKEND_AGENT_SET:
-            allowed = ", ".join(BACKEND_AGENTS)
+        if agent not in _backend_agent_set():
+            allowed = ", ".join(_backend_agents())
             self.add_system(f"invalid agent: {agent} (use one of: {allowed})", "denied")
             return
         code, out, err = await self._run_polycule_cli("agent", action, agent)
@@ -1514,8 +1435,8 @@ class ChatTUI:
         self.add_system(out or f"{action}d {agent}", "granted")
 
     async def _run_agent_mode(self, agent: str, mode: str):
-        if agent not in BACKEND_AGENT_SET:
-            allowed = ", ".join(BACKEND_AGENTS)
+        if agent not in _backend_agent_set():
+            allowed = ", ".join(_backend_agents())
             self.add_system(f"invalid agent: {agent} (use one of: {allowed})", "denied")
             return
         if mode not in AGENT_MODES:
@@ -1554,8 +1475,8 @@ class ChatTUI:
             if not value:
                 continue
             if value == "all":
-                return list(BACKEND_AGENTS)
-            if value in BACKEND_AGENT_SET and value not in out:
+                return list(_backend_agents())
+            if value in _backend_agent_set() and value not in out:
                 out.append(value)
         return out
 
@@ -1796,7 +1717,7 @@ class ChatTUI:
                 continue
             agent, rest = line.split(":", 1)
             name = agent.strip().lower()
-            if name not in BACKEND_AGENT_SET:
+            if name not in _backend_agent_set():
                 continue
             fields: dict[str, str] = {}
             for token in rest.strip().split():
@@ -1818,21 +1739,24 @@ class ChatTUI:
         joined = " ".join(words)
         recommendations: list[tuple[str, int, str]] = []
 
-        for agent in BACKEND_AGENTS:
+        backend_agents = _backend_agents()
+        hints = _agent_capability_hints()
+        free_agents = _free_agents()
+        for agent in backend_agents:
             status = agent_state.get(agent, {})
             current_state = status.get("state", "enabled")
             current_mode = status.get("mode", DEFAULT_AGENT_MODE(agent))
             if current_state != "enabled" or current_mode == "off":
                 continue
 
-            profile = AGENT_CAPABILITY_HINTS.get(agent, {})
+            profile = hints.get(agent, {})
             score = 1
             reasons = []
             for keyword, weight in profile.get("keywords", {}).items():
                 if keyword in joined:
                     score += int(weight)
                     reasons.append(keyword)
-            if agent in FREE_AGENTS:
+            if agent in free_agents:
                 score += 1
             if current_mode == "always":
                 score += 1
@@ -1840,12 +1764,14 @@ class ChatTUI:
                 reasons.append(profile.get("summary", "general fit"))
             recommendations.append((agent, score, ", ".join(reasons[:3])))
 
-        recommendations.sort(key=lambda item: (-item[1], BACKEND_AGENTS.index(item[0])))
+        recommendations.sort(key=lambda item: (-item[1], backend_agents.index(item[0])))
         return recommendations
 
     async def _run_free_mode(self):
         self._free_mode = not self._free_mode
-        for agent in PAID_AGENTS:
+        paid_agents = _paid_agents()
+        free_agents = list(_free_agents())
+        for agent in paid_agents:
             if self._free_mode:
                 code, out, err = await self._run_polycule_cli("agent", "disable", agent)
                 if code != 0:
@@ -1855,7 +1781,10 @@ class ChatTUI:
                 if code != 0:
                     self.add_system(err or out or f"failed to enable {agent}", "denied")
         if self._free_mode:
-            status_msg = "free mode: only free agents enabled (cassette, wizard, opencode)"
+            status_msg = (
+                "free mode: only local/non-premium agents enabled "
+                f"({', '.join(free_agents) if free_agents else 'none'})"
+            )
         else:
             status_msg = "free mode off: all agents enabled"
         self.add_system(status_msg, "granted" if self._free_mode else "system_fg")
@@ -1871,9 +1800,10 @@ class ChatTUI:
             self.add_system(detail, "denied")
             return
         state = self._parse_agent_status_output(out)
+        backend_agents = _backend_agents()
         active = [
             agent
-            for agent in BACKEND_AGENTS
+            for agent in backend_agents
             if state.get(agent, {}).get("state", "enabled") == "enabled"
             and state.get(agent, {}).get("mode", DEFAULT_AGENT_MODE(agent)) != "off"
         ]

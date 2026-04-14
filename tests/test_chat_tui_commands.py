@@ -1,6 +1,12 @@
+import os
 import sys
 import unittest
 from pathlib import Path
+
+os.environ["POLYCULE_HERMES_PROFILES"] = "cassette,wizard"
+os.environ["POLYCULE_INCLUDE_UNAVAILABLE_HERMES"] = "1"
+os.environ["POLYCULE_EXTERNAL_AGENTS"] = "codex,claude,opencode,gemini"
+os.environ["POLYCULE_INCLUDE_UNAVAILABLE_EXTERNALS"] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'src'

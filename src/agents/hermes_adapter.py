@@ -5,9 +5,9 @@ Hermes Adapter for Polycule Hub
 Hermes is a TUI REPL (like Claude Code). It has no persistent session —
 each invocation starts fresh unless --resume SESSION_ID is passed.
 
-Two Hermes agents:
-  cassette  → hermes chat -Q -q "prompt"               (default profile)
-  wizard    → hermes chat --profile wizard -Q -q "prompt"
+Hermes profiles are discovered from ~/.hermes and can be launched as named
+Polycule agents. The default Hermes profile uses the root ~/.hermes config;
+named Hermes profiles use ~/.hermes/profiles/<profile>.
 
 This adapter calls Hermes in non-interactive, quiet mode (-Q -q) for each
 message it responds to. Context from the chat log is injected into the prompt
@@ -16,23 +16,24 @@ so the stateless agent has the necessary background.
 Optionally pass --resume SESSION_ID to resume a prior session.
 
 Usage:
-    # Run as cassette (default)
-    python3 hermes_adapter.py --name Cassette --room Default
+    # Run the default Hermes profile
+    python3 hermes_adapter.py --name hermes --profile default --room Default
 
-    # Run as wizard
-    python3 hermes_adapter.py --name Wizard --profile wizard --room Default
+    # Run a named Hermes profile
+    python3 hermes_adapter.py --name analyst --profile analyst --room Default
 
     # Respond to all messages (not just mentions)
-    python3 hermes_adapter.py --name Wizard --profile wizard --always
+    python3 hermes_adapter.py --name analyst --profile analyst --always
 
     # Resume a prior session
-    python3 hermes_adapter.py --name Wizard --profile wizard --resume abc123
+    python3 hermes_adapter.py --name analyst --profile analyst --resume abc123
 """
 
 import argparse
 import asyncio
 import logging
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -48,6 +49,7 @@ from hermes_sessions import (
     rename_hermes_session,
     snapshot_hermes_sessions,
 )
+from managed_agents import get_managed_agent_names
 from runtime_state import (
     clear_agent_session_entry,
     get_agent_session_entry,
@@ -60,6 +62,7 @@ from runtime_state import (
 logger = logging.getLogger(__name__)
 
 HERMES_BIN = Path.home() / ".hermes" / "bin" / "hermes"
+HERMES_FALLBACK = shutil.which("hermes") or "hermes"
 DEFAULT_HERMES_TIMEOUT_SECONDS = 240.0
 BOOTSTRAP_CONTEXT_LIMIT = 60
 RESUME_FALLBACK_CONTEXT_LIMIT = 20
@@ -70,43 +73,48 @@ _TRAILING_SESSION_ID_RE = re.compile(
     r"^\s*session_id:\s*(?P<session_id>\S+)\s*$",
     re.MULTILINE,
 )
+_ANY_MENTION_RE = re.compile(r"@[\w-]+")
 
-# Trigger words that cause Hermes to respond
-CASSETTE_MENTION_TRIGGERS = frozenset({"@cassette", "@hermes"})
-CASSETTE_HUMAN_TRIGGERS = frozenset({"cassette", "hermes"})
-WIZARD_MENTION_TRIGGERS = frozenset({"@wizard"})
-WIZARD_HUMAN_TRIGGERS = frozenset({"wizard"})
 
-# All agent trigger words — used to detect when a message is exclusively
-# addressed to a different agent (cross-address exclusion).
-_ALL_AGENT_TRIGGERS = (
-    CASSETTE_MENTION_TRIGGERS
-    | CASSETTE_HUMAN_TRIGGERS
-    | WIZARD_MENTION_TRIGGERS
-    | WIZARD_HUMAN_TRIGGERS
-    | frozenset({"@claude", "claude", "@codex", "codex"})
-)
+def _trigger_sets(name: str, profile: str) -> tuple[frozenset[str], frozenset[str]]:
+    mentions = {f"@{name.strip().lower()}"}
+    words = {name.strip().lower()}
 
-SYSTEM_PROMPT_CASSETTE = """You are Cassette, a Hermes AI agent participating in the \
-Polycule multi-agent workspace. You are collaborating with the human operator and potentially \
-other agents. Be helpful, direct, and technically precise. Respond concisely."""
+    normalized_profile = normalize_hermes_profile(profile)
+    if normalized_profile not in {"", "default"}:
+        mentions.add(f"@{normalized_profile}")
+        words.add(normalized_profile)
+    elif name.strip().lower() != "hermes":
+        mentions.add("@hermes")
+        words.add("hermes")
 
-SYSTEM_PROMPT_WIZARD = """You are Wizard, a Hermes AI agent participating in the Polycule \
-multi-agent workspace. You are direct, technically sharp, and occasionally sardonic. \
-You collaborate with the human operator, Cassette, Claude, and Codex. If you disagree, say so. \
-Don't pad your responses."""
+    return frozenset(item for item in mentions if item and item != "@"), frozenset(
+        item for item in words if item
+    )
+
+
+def _system_prompt(name: str, profile: str) -> str:
+    normalized_profile = normalize_hermes_profile(profile)
+    profile_label = "default" if normalized_profile == "default" else normalized_profile
+    return (
+        f"You are {name}, a Hermes AI agent participating in the Polycule "
+        f"multi-agent workspace. Your Hermes profile is '{profile_label}'. "
+        f"Collaborate with the human operator and any other agents in the room. "
+        f"Be concise, direct, and technically precise. Respond only when addressed "
+        f"or when your response mode/watch policy says to."
+    )
 
 
 class HermesAdapter(BaseAdapter):
     """
-    Hermes adapter — supports cassette (default) and wizard profiles.
+    Hermes adapter — supports the default Hermes profile plus any named profile.
     Calls `hermes chat -Q -q "prompt"` for each response.
     """
 
     def __init__(
         self,
-        name: str = "Cassette",
-        profile: str = "cassette",
+        name: str = "Hermes",
+        profile: str = "default",
         room: str = "Default",
         hub_host: str = "localhost",
         hub_port: int = 7777,
@@ -124,24 +132,17 @@ class HermesAdapter(BaseAdapter):
             hub_port=hub_port,
         )
         super().__init__(config)
-        self.profile = profile.lower()
+        self.profile = normalize_hermes_profile(profile)
         self.always_respond = always_respond
         self.always_all = always_all
         self.resume_session = resume_session
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self._responding = False
-
-        # Set triggers and system prompt based on profile
-        if self.profile == "wizard":
-            self._mention_triggers = WIZARD_MENTION_TRIGGERS
-            self._human_word_triggers = WIZARD_HUMAN_TRIGGERS
-            self._system_prompt = SYSTEM_PROMPT_WIZARD
-        else:
-            self._mention_triggers = CASSETTE_MENTION_TRIGGERS
-            self._human_word_triggers = CASSETTE_HUMAN_TRIGGERS
-            self._system_prompt = SYSTEM_PROMPT_CASSETTE
-
-        self.profile = normalize_hermes_profile(self.profile)
+        self._mention_triggers, self._human_word_triggers = _trigger_sets(
+            self.config.name,
+            self.profile,
+        )
+        self._system_prompt = _system_prompt(self.config.name, self.profile)
         self.session_key = make_agent_session_key(
             "hermes",
             room,
@@ -160,10 +161,11 @@ class HermesAdapter(BaseAdapter):
 
     def _build_cmd(self, prompt: str) -> list:
         """Build the hermes chat invocation for non-interactive one-shot use."""
-        cmd = [str(HERMES_BIN), "chat", "-Q", "-q", prompt]
-        if self.profile not in ("cassette", "default", ""):
+        hermes_bin = str(HERMES_BIN) if HERMES_BIN.exists() else HERMES_FALLBACK
+        cmd = [hermes_bin, "chat", "-Q", "-q", prompt]
+        if self.profile not in ("default", ""):
             cmd = [
-                str(HERMES_BIN),
+                hermes_bin,
                 "chat",
                 "--profile",
                 self.profile,
@@ -183,13 +185,18 @@ class HermesAdapter(BaseAdapter):
         """True if message mentions another agent but not this agent.
 
         Used to prevent always-mode agents from responding to messages
-        that are clearly directed at a different agent (e.g. wizard ignoring
-        'okay cassette, can you...' when cassette but not wizard is named).
+        that are clearly directed at a different agent.
         """
         my_triggers = self._mention_triggers | self._human_word_triggers
         if self.has_any_trigger(content, my_triggers):
             return False  # message includes me — respond
-        other_triggers = _ALL_AGENT_TRIGGERS - my_triggers
+        if _ANY_MENTION_RE.search(content.lower()):
+            return True
+        other_triggers = {
+            token.lower()
+            for token in get_managed_agent_names()
+            if token.strip().lower() not in my_triggers
+        } | frozenset({"codex", "claude", "opencode", "gemini"})
         return self.has_any_trigger(content, other_triggers)
 
     def _should_respond(self, message: dict) -> bool:
@@ -415,8 +422,9 @@ class HermesAdapter(BaseAdapter):
         if self.room_id:
             await self.send_command("agent_typing", is_typing=True)
 
-        if not HERMES_BIN.exists():
-            detail = f"Hermes binary not found: {HERMES_BIN}"
+        hermes_bin = str(HERMES_BIN) if HERMES_BIN.exists() else shutil.which("hermes")
+        if not hermes_bin:
+            detail = "Hermes binary not found. Install Hermes or add `hermes` to PATH."
             logger.error(detail)
             return None, "missing_bin", 0.0, detail
 
@@ -550,7 +558,7 @@ class HermesAdapter(BaseAdapter):
                 directive_id=directive_id,
                 state="accepted",
             )
-        mention = "@wizard" if self.profile == "wizard" else "@cassette"
+        mention = next(iter(sorted(self._mention_triggers)), f"@{self.config.name.lower()}")
         content = str(message.get("content", "")).strip()
         refs = message.get("refs", [])
         if isinstance(refs, list) and refs:
@@ -577,12 +585,12 @@ def main():
     parser.add_argument(
         "--name",
         default=None,
-        help="Display name (default: Wizard for wizard profile, Cassette otherwise)",
+        help="Display name (defaults to 'hermes' for default profile or the profile name)",
     )
     parser.add_argument(
         "--profile",
-        default="cassette",
-        help="Hermes profile: cassette (default) or wizard",
+        default="default",
+        help="Hermes profile to run (default: default)",
     )
     parser.add_argument("--room", default="Default")
     parser.add_argument("--host", default="localhost")
@@ -612,9 +620,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # Default names by profile
     if args.name is None:
-        args.name = "Wizard" if args.profile == "wizard" else "Cassette"
+        normalized_profile = normalize_hermes_profile(args.profile)
+        args.name = "hermes" if normalized_profile == "default" else normalized_profile
 
     logging.basicConfig(
         level=logging.INFO,

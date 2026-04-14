@@ -13,12 +13,7 @@ Default layout:
     pane 0  empty worker pane (single pane)
   Window 'backend':
     pane 0  hub log
-    pane 1  cassette
-    pane 2  wizard
-    pane 3  codex
-    pane 4  claude
-    pane 5  opencode
-    pane 6  gemini
+    pane 1+ discovered backend agents
 """
 import os
 import subprocess
@@ -142,21 +137,23 @@ def _pane_rows(session: str, window_name: str, retries: int = 3) -> list:
             '-t',
             f'{session}:{window_name}',
             '-F',
-            '#{pane_id}:#{pane_left}:#{pane_top}:#{@name}',
+            '#{pane_id}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}:#{@name}',
         )
         rows = []
         if result.returncode == 0:
             for line in result.stdout.strip().splitlines():
-                parts = line.split(':', 3)
-                if len(parts) != 4:
+                parts = line.split(':', 5)
+                if len(parts) != 6:
                     continue
-                pane_id, left, top, label = parts
+                pane_id, left, top, width, height, label = parts
                 try:
                     rows.append(
                         {
                             'pane_id': pane_id,
                             'left': int(left),
                             'top': int(top),
+                            'width': int(width),
+                            'height': int(height),
                             'label': label.strip(),
                         }
                     )
@@ -181,6 +178,18 @@ def _ensure_window(session: str, window_name: str):
     _tmux('new-window', '-t', f'{session}:', '-n', window_name)
     if not window_exists(session, window_name):
         raise RuntimeError(f"Failed creating tmux window '{window_name}' in session '{session}'")
+
+
+def _unique_session_name(base: str = 'polycule') -> str:
+    existing = {name for name, _attached in get_tmux_sessions()}
+    if base not in existing:
+        return base
+    counter = 2
+    while True:
+        candidate = f'{base}-{counter}'
+        if candidate not in existing:
+            return candidate
+        counter += 1
 
 
 def _kill_extra_panes(session: str, window_name: str, keep_count: int):
@@ -231,56 +240,45 @@ def _ensure_swarm_window(session: str) -> dict:
     return {'swarm': swarm_pane}
 
 
-def _ensure_backend_window(session: str) -> dict:
+def _ensure_backend_window(session: str, backend_labels: list[str]) -> dict:
     """
-    Ensure backend window exists with seven persistent panes:
-    hub-log, cassette, wizard, codex, claude, opencode, gemini.
+    Ensure backend window exists with one hub pane plus one pane per backend
+    agent label.
     """
     _ensure_window(session, 'backend')
     rows = _pane_rows(session, 'backend')
     if not rows:
         raise RuntimeError(f"Window '{session}:backend' has no panes")
 
-    while len(rows) < 7:
+    required_count = max(1, len(backend_labels) + 1)
+
+    while len(rows) < required_count:
         if len(rows) == 1:
             _tmux('split-window', '-t', rows[0]['pane_id'], '-h')
         else:
-            target = max(rows, key=lambda r: (r['left'], r['top']))['pane_id']
+            target = max(
+                rows,
+                key=lambda r: (r.get('width', 0) * r.get('height', 0), r['width'], r['height']),
+            )['pane_id']
             _tmux('split-window', '-t', target, '-v')
         rows = _pane_rows(session, 'backend')
         if not rows:
             raise RuntimeError("Backend pane creation failed")
 
-    _kill_extra_panes(session, 'backend', keep_count=7)
+    _kill_extra_panes(session, 'backend', keep_count=required_count)
     rows = _pane_rows(session, 'backend')
-    if len(rows) != 7:
-        raise RuntimeError("Could not reconcile backend window to seven panes")
+    if len(rows) != required_count:
+        raise RuntimeError(f"Could not reconcile backend window to {required_count} panes")
 
     hub_pane = rows[0]['pane_id']
-    cassette_pane = rows[1]['pane_id']
-    wizard_pane = rows[2]['pane_id']
-    codex_pane = rows[3]['pane_id']
-    claude_pane = rows[4]['pane_id']
-    opencode_pane = rows[5]['pane_id']
-    gemini_pane = rows[6]['pane_id']
 
     _label_pane(hub_pane, 'hub-log', 'hub-log')
-    _label_pane(cassette_pane, 'cassette', 'cassette')
-    _label_pane(wizard_pane, 'wizard', 'wizard')
-    _label_pane(codex_pane, 'codex', 'codex')
-    _label_pane(claude_pane, 'claude', 'claude')
-    _label_pane(opencode_pane, 'opencode', 'opencode')
-    _label_pane(gemini_pane, 'gemini', 'gemini')
-
-    return {
-        'hub_log': hub_pane,
-        'cassette': cassette_pane,
-        'wizard': wizard_pane,
-        'codex': codex_pane,
-        'claude': claude_pane,
-        'opencode': opencode_pane,
-        'gemini': gemini_pane,
-    }
+    panes = {'hub_log': hub_pane}
+    for index, label in enumerate(backend_labels, start=1):
+        pane_id = rows[index]['pane_id']
+        _label_pane(pane_id, label, label)
+        panes[label] = pane_id
+    return panes
 
 
 def _enforce_window_order(session: str):
@@ -308,16 +306,17 @@ def _enforce_window_order(session: str):
         _tmux('move-window', '-s', f'{session}:{name}', '-t', f'{session}:{base + offset}')
 
 
-def setup_polycule_layout(session: str) -> dict:
+def setup_polycule_layout(session: str, backend_labels: Optional[list[str]] = None) -> dict:
     """
     Create/reconcile default layout in session.
     Returns pane targets including:
-      human, chat, swarm, hub_log, cassette, wizard, codex, claude, opencode, gemini
+      human, chat, swarm, hub_log, and one key per backend agent label
     """
+    backend_labels = [label for label in (backend_labels or []) if str(label).strip()]
     panes = {}
     panes.update(_ensure_polycule_window(session))
     panes.update(_ensure_swarm_window(session))
-    panes.update(_ensure_backend_window(session))
+    panes.update(_ensure_backend_window(session, backend_labels))
     _enforce_window_order(session)
 
     _tmux('select-window', '-t', f'{session}:polycule')
@@ -326,7 +325,7 @@ def setup_polycule_layout(session: str) -> dict:
 
     print(
         "  polycule layout ready: "
-        "polycule(human|chat) + swarm(single) + backend(hub-log|cassette|wizard|codex|claude|opencode|gemini)"
+        f"polycule(human|chat) + swarm(single) + backend(hub-log{'|' + '|'.join(backend_labels) if backend_labels else ''})"
     )
     return panes
 
@@ -335,7 +334,7 @@ def setup_polycule_layout(session: str) -> dict:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def init(force_new: bool = False) -> tuple:
+def init(force_new: bool = False, backend_labels: Optional[list[str]] = None) -> tuple:
     """
     Detect or create session, set up layout.
     Returns (session_name, pane_targets_dict).
@@ -345,30 +344,31 @@ def init(force_new: bool = False) -> tuple:
     session = current_session()
     if session and not force_new:
         print(f"  detected session: {session}")
-        panes = setup_polycule_layout(session)
+        panes = setup_polycule_layout(session, backend_labels=backend_labels)
         return session, panes
 
     sessions = get_tmux_sessions()
 
     if not sessions or force_new:
-        print("  creating new 'polycule' session")
-        _tmux('new-session', '-d', '-s', 'polycule', '-n', 'polycule', check=False)
-        panes = setup_polycule_layout('polycule')
-        return 'polycule', panes
+        session_name = _unique_session_name('polycule')
+        print(f"  creating new '{session_name}' session")
+        _tmux('new-session', '-d', '-s', session_name, '-n', 'polycule', check=False)
+        panes = setup_polycule_layout(session_name, backend_labels=backend_labels)
+        return session_name, panes
 
     if len(sessions) == 1 and not force_new:
         session = sessions[0][0]
         print(f"  using existing session: {session}")
-        panes = setup_polycule_layout(session)
+        panes = setup_polycule_layout(session, backend_labels=backend_labels)
         return session, panes
 
     chosen = pick_session(sessions)
     if chosen is None:
-        _tmux('new-session', '-d', '-s', 'polycule', '-n', 'polycule', check=False)
-        chosen = 'polycule'
+        chosen = _unique_session_name('polycule')
+        _tmux('new-session', '-d', '-s', chosen, '-n', 'polycule', check=False)
         print(f"  created new session: {chosen}")
 
-    panes = setup_polycule_layout(chosen)
+    panes = setup_polycule_layout(chosen, backend_labels=backend_labels)
     return chosen, panes
 
 

@@ -18,7 +18,6 @@ import asyncio
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +28,13 @@ DB_PATH = PROJECT_DIR / 'polycule.db'
 sys.path.insert(0, str(SRC_DIR))
 
 from hermes_sessions import hermes_session_exists
+from managed_agents import (
+    external_agent_available,
+    get_default_backend_agent_modes,
+    get_managed_agent_lookup,
+    get_managed_agent_names,
+    hermes_available,
+)
 from runtime_state import (
     clear_agent_session_entry,
     get_agent_session_entry,
@@ -47,17 +53,7 @@ from session_backends import (
     opencode_session_exists,
 )
 
-MANAGED_BACKEND_AGENTS = ('cassette', 'wizard', 'codex', 'claude', 'opencode', 'gemini')
-LAUNCHABLE_AGENTS = ('hermes', 'cassette', 'wizard', 'claude', 'codex', 'opencode', 'gemini')
 AGENT_MODE_VALUES = ('mention', 'always', 'off')
-DEFAULT_AGENT_MODES = {
-    'cassette': 'always',
-    'wizard': 'always',
-    'codex': 'always',
-    'claude': 'mention',
-    'opencode': 'mention',
-    'gemini': 'mention',
-}
 CODEX_DISCOVERY_PREFIX = "You are Codex, an AI coding agent participating in the Polycule"
 CLAUDE_DISCOVERY_HINT = (
     "You are Claude, an AI assistant participating in the Polycule "
@@ -67,6 +63,28 @@ GEMINI_DISCOVERY_HINT = (
     "You are Gemini, an AI assistant participating in the Polycule "
     "multi-agent workspace."
 )
+
+
+def _managed_backend_agents() -> tuple[str, ...]:
+    return tuple(get_managed_agent_names())
+
+
+def _managed_agent_lookup():
+    return get_managed_agent_lookup()
+
+
+def _default_agent_modes() -> dict[str, str]:
+    return get_default_backend_agent_modes()
+
+
+def _default_agent_mode(agent_name: str) -> str:
+    return _default_agent_modes().get(agent_name.strip().lower(), 'mention')
+
+
+def _launchable_agents() -> tuple[str, ...]:
+    managed = set(_managed_backend_agents())
+    managed.update({'hermes', 'claude', 'codex', 'opencode', 'gemini'})
+    return tuple(sorted(managed))
 
 
 def _default_human_name() -> str:
@@ -92,16 +110,18 @@ def _load_disabled_agents() -> set[str]:
             items = []
     except json.JSONDecodeError:
         items = []
-    return {str(item).lower() for item in items if str(item).lower() in MANAGED_BACKEND_AGENTS}
+    managed = set(_managed_backend_agents())
+    return {str(item).lower() for item in items if str(item).lower() in managed}
 
 
 def _save_disabled_agents(disabled: set[str]):
-    payload = sorted(a for a in disabled if a in MANAGED_BACKEND_AGENTS)
+    managed = set(_managed_backend_agents())
+    payload = sorted(a for a in disabled if a in managed)
     _db().set_setting('disabled_agents', json.dumps(payload))
 
 
 def _load_agent_modes() -> dict[str, str]:
-    modes = dict(DEFAULT_AGENT_MODES)
+    modes = dict(_default_agent_modes())
     raw = _db().get_setting('agent_modes', '') or ''
     if not raw:
         return modes
@@ -111,7 +131,7 @@ def _load_agent_modes() -> dict[str, str]:
         return modes
     if not isinstance(parsed, dict):
         return modes
-    for agent in MANAGED_BACKEND_AGENTS:
+    for agent in _managed_backend_agents():
         value = str(parsed.get(agent, '')).strip().lower()
         if value in AGENT_MODE_VALUES:
             modes[agent] = value
@@ -120,9 +140,11 @@ def _load_agent_modes() -> dict[str, str]:
 
 def _save_agent_modes(modes: dict[str, str]):
     payload = {}
-    for agent in MANAGED_BACKEND_AGENTS:
-        value = str(modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))).strip().lower()
-        payload[agent] = value if value in AGENT_MODE_VALUES else DEFAULT_AGENT_MODES.get(agent, 'mention')
+    defaults = _default_agent_modes()
+    for agent in _managed_backend_agents():
+        fallback = defaults.get(agent, 'mention')
+        value = str(modes.get(agent, fallback)).strip().lower()
+        payload[agent] = value if value in AGENT_MODE_VALUES else fallback
     _db().set_setting('agent_modes', json.dumps(payload))
 
 
@@ -146,24 +168,19 @@ def _backend_agent_command(agent_name: str, room: str, mode: str = 'mention') ->
     proj_q = shlex.quote(str(PROJECT_DIR))
     agent = agent_name.lower()
     mode = mode.lower().strip()
-
-    if agent == 'cassette':
+    spec = _managed_agent_lookup().get(agent)
+    if spec and spec.adapter == 'hermes':
         always_flag = ' --always' if mode == 'always' else ''
-        resume_flag = _managed_hermes_resume_flag('cassette', room)
-        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('hermes', room, profile='cassette'))}"
-        return (
-            f"cd {proj_q} && "
-            f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'hermes_adapter.py'))} "
-            f"--name cassette --profile cassette --room {room_q}{title_flag}{resume_flag}{always_flag}"
+        resume_flag = _managed_hermes_resume_flag(spec.profile, room)
+        title_flag = (
+            f" --session-title "
+            f"{shlex.quote(_ensure_managed_session_title('hermes', room, profile=spec.profile))}"
         )
-    if agent == 'wizard':
-        always_flag = ' --always' if mode == 'always' else ''
-        resume_flag = _managed_hermes_resume_flag('wizard', room)
-        title_flag = f" --session-title {shlex.quote(_ensure_managed_session_title('hermes', room, profile='wizard'))}"
         return (
             f"cd {proj_q} && "
             f"nocorrect python3 {shlex.quote(str(SRC_DIR / 'agents' / 'hermes_adapter.py'))} "
-            f"--name wizard --profile wizard --room {room_q}{title_flag}{resume_flag}{always_flag}"
+            f"--name {shlex.quote(spec.name)} --profile {shlex.quote(spec.profile)} "
+            f"--room {room_q}{title_flag}{resume_flag}{always_flag}"
         )
     if agent == 'codex':
         always_flag = ' --always' if mode == 'always' else ''
@@ -224,37 +241,14 @@ def _unavailable_notice_command(agent_name: str, detail: str) -> str:
 
 def _agent_availability(agent_name: str) -> tuple[bool, str]:
     agent = agent_name.strip().lower()
+    spec = _managed_agent_lookup().get(agent)
+    adapter = spec.adapter if spec else agent
 
-    if agent in ('cassette', 'wizard', 'hermes'):
-        hermes_bin = Path.home() / '.hermes' / 'bin' / 'hermes'
-        if hermes_bin.exists():
-            return True, str(hermes_bin)
-        found = shutil.which('hermes')
-        if found:
-            return True, found
-        return False, "requires Hermes CLI (`hermes`)"
-
-    if agent == 'codex':
-        codex_bin = Path('/usr/local/bin/codex')
-        if codex_bin.exists():
-            return True, str(codex_bin)
-        found = shutil.which('codex')
-        if found:
-            return True, found
-        return False, "requires Codex CLI (`codex`)"
-
-    binary_by_agent = {
-        'claude': 'claude',
-        'opencode': 'opencode',
-        'gemini': 'gemini',
-    }
-    binary = binary_by_agent.get(agent)
-    if not binary:
-        return False, f"unknown dependency for {agent_name}"
-    found = shutil.which(binary)
-    if found:
-        return True, found
-    return False, f"requires {binary} CLI (`{binary}`)"
+    if adapter == 'hermes':
+        return hermes_available()
+    if adapter in {'codex', 'claude', 'opencode', 'gemini'}:
+        return external_agent_available(adapter)
+    return False, f"unknown dependency for {agent_name}"
 
 
 def _find_named_panes(label: str) -> list[str]:
@@ -432,8 +426,9 @@ def _resolve_managed_gemini_session(room: str) -> str | None:
 
 def _resolve_managed_session(agent_name: str, room: str) -> str | None:
     agent = agent_name.strip().lower()
-    if agent in ('cassette', 'wizard'):
-        return _resolve_managed_hermes_session(agent, room)
+    spec = _managed_agent_lookup().get(agent)
+    if spec and spec.adapter == 'hermes':
+        return _resolve_managed_hermes_session(spec.profile, room)
     if agent == 'codex':
         return _resolve_managed_codex_session(room)
     if agent == 'claude':
@@ -464,7 +459,7 @@ def _set_agent_runtime_state(agent_name: str, enabled: bool, room: str, modes: d
     if not panes:
         return
     modes = modes or _load_agent_modes()
-    mode = str(modes.get(agent_name, DEFAULT_AGENT_MODES.get(agent_name, 'mention'))).lower()
+    mode = str(modes.get(agent_name, _default_agent_mode(agent_name))).lower()
     available, detail = _agent_availability(agent_name)
     for pane_id in panes:
         if not enabled:
@@ -509,7 +504,8 @@ def cmd_start(args):
     from session_init import init
 
     print("Starting Polycule...")
-    session, panes = init(force_new=args.new)
+    managed_agents = list(_managed_backend_agents())
+    session, panes = init(force_new=args.new, backend_labels=managed_agents)
 
     hub_pane = panes.get('hub_log')
     chat_pane = panes.get('chat')
@@ -544,12 +540,14 @@ def cmd_start(args):
         print("  Warning: no chat pane found; start TUI manually: polycule tui")
 
     print("  Backend agents:")
-    for agent in MANAGED_BACKEND_AGENTS:
+    if not managed_agents:
+        print("    - none discovered on this machine")
+    for agent in managed_agents:
         pane_id = panes.get(agent)
         if not pane_id:
             print(f"    - {agent}: missing pane")
             continue
-        mode = modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))
+        mode = modes.get(agent, _default_agent_mode(agent))
         if agent in disabled:
             _run_in_pane(pane_id, _disabled_notice_command(agent))
             print(f"    - {agent}: disabled (cooldown)")
@@ -597,20 +595,27 @@ def cmd_tui(args):
 def cmd_agent(args):
     """Launch adapter OR manage backend agent cooldown state."""
     action = args.agent_or_action.lower()
+    managed_agents = _managed_backend_agents()
+    managed_lookup = _managed_agent_lookup()
 
     if action in ('enable', 'disable', 'status', 'mode', 'modes'):
         if action == 'status':
             disabled = _load_disabled_agents()
             modes = _load_agent_modes()
-            enabled = [a for a in MANAGED_BACKEND_AGENTS if a not in disabled]
+            enabled = [a for a in managed_agents if a not in disabled]
             print(f"Enabled:  {', '.join(enabled) if enabled else '(none)'}")
             print(f"Disabled: {', '.join(sorted(disabled)) if disabled else '(none)'}")
-            for agent in MANAGED_BACKEND_AGENTS:
+            for agent in managed_agents:
                 state = 'disabled' if agent in disabled else 'enabled'
-                mode = modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))
+                mode = modes.get(agent, _default_agent_mode(agent))
                 available, detail = _agent_availability(agent)
                 availability = 'available' if available else 'missing'
                 line = f"{agent}: state={state} mode={mode} availability={availability}"
+                spec = managed_lookup.get(agent)
+                if spec and spec.adapter == 'hermes':
+                    line += f" adapter=hermes profile={spec.profile}"
+                elif spec:
+                    line += f" adapter={spec.adapter}"
                 if detail:
                     line += f" detail={detail}"
                 print(line)
@@ -618,14 +623,14 @@ def cmd_agent(args):
 
         if action == 'modes':
             modes = _load_agent_modes()
-            for agent in MANAGED_BACKEND_AGENTS:
-                print(f"{agent}: {modes.get(agent, DEFAULT_AGENT_MODES.get(agent, 'mention'))}")
+            for agent in managed_agents:
+                print(f"{agent}: {modes.get(agent, _default_agent_mode(agent))}")
             return
 
         target = (args.target_agent or '').strip().lower()
-        if target not in MANAGED_BACKEND_AGENTS:
+        if target not in managed_lookup:
             print(f"Unknown backend agent: {target or '(missing)'}", file=sys.stderr)
-            print(f"Available: {', '.join(MANAGED_BACKEND_AGENTS)}", file=sys.stderr)
+            print(f"Available: {', '.join(managed_agents) if managed_agents else '(none)'}", file=sys.stderr)
             sys.exit(1)
 
         if action == 'mode':
@@ -646,11 +651,6 @@ def cmd_agent(args):
         print(f"{'Enabled' if enabling else 'Disabled'} {target}")
         return
 
-    profile_map = {
-        'wizard': ('hermes', 'wizard', 'wizard'),
-        'cassette': ('hermes', 'cassette', 'cassette'),
-        'hermes': ('hermes', 'cassette', 'cassette'),
-    }
     agent_scripts = {
         'hermes': SRC_DIR / 'agents' / 'hermes_adapter.py',
         'claude': SRC_DIR / 'agents' / 'claude_adapter.py',
@@ -660,31 +660,44 @@ def cmd_agent(args):
     }
 
     agent_type = action
-    if agent_type not in LAUNCHABLE_AGENTS:
+    if agent_type not in _launchable_agents():
         print(f"Unknown agent type/action: {action}")
-        print(f"Launchable agents: {', '.join(LAUNCHABLE_AGENTS)}")
+        print(f"Launchable agents: {', '.join(_launchable_agents())}")
         print("Cooldown controls: enable <agent>, disable <agent>, status")
         sys.exit(1)
 
-    script_key = agent_type
+    script_key = 'hermes' if agent_type == 'hermes' else agent_type
     extra_flags = []
     selected_profile = None
+    default_name = None
 
-    if agent_type in profile_map:
-        script_key, profile, default_name = profile_map[agent_type]
-        selected_profile = profile
-        extra_flags += ['--profile', profile]
-        if not args.name:
-            extra_flags += ['--name', default_name]
+    managed_spec = managed_lookup.get(agent_type)
+    if agent_type == 'hermes':
+        selected_profile = (args.profile or 'default').strip().lower() or 'default'
+        default_name = 'hermes' if selected_profile in {'', 'default', 'hermes'} else selected_profile
+        extra_flags += ['--profile', selected_profile]
+    elif managed_spec and managed_spec.adapter == 'hermes':
+        script_key = 'hermes'
+        selected_profile = managed_spec.profile
+        default_name = managed_spec.name
+        extra_flags += ['--profile', selected_profile]
+    elif managed_spec:
+        script_key = managed_spec.adapter
+        default_name = managed_spec.name
+
+    if default_name and not args.name:
+        extra_flags += ['--name', default_name]
 
     agent_py = agent_scripts.get(script_key)
     if not agent_py:
         print(f"Unknown agent type: {agent_type}")
-        print("Available: hermes, wizard, cassette, claude, codex, opencode, gemini")
+        print(f"Available: {', '.join(_launchable_agents())}")
         sys.exit(1)
 
-    availability_key = selected_profile if script_key == 'hermes' and selected_profile else script_key
-    available, detail = _agent_availability(availability_key)
+    if script_key == 'hermes':
+        available, detail = hermes_available()
+    else:
+        available, detail = _agent_availability(script_key)
     if not available:
         print(f"Cannot launch {agent_type}: {detail}", file=sys.stderr)
         sys.exit(1)
@@ -833,13 +846,13 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument(
         'agent_or_action',
         metavar='TYPE|ACTION',
-        help='TYPE: hermes|cassette|wizard|claude|codex|opencode|gemini; ACTION: enable|disable|status|mode|modes',
+        help='TYPE: hermes|<discovered-agent>|claude|codex|opencode|gemini; ACTION: enable|disable|status|mode|modes',
     )
     a.add_argument(
         'target_agent',
         nargs='?',
         metavar='AGENT',
-        help='required for enable/disable/mode: cassette|wizard|codex|claude|opencode|gemini',
+        help='required for enable/disable/mode: one of the discovered managed agents',
     )
     a.add_argument(
         'action_value',
@@ -851,6 +864,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument('--room', default='Default')
     a.add_argument('--host', default='localhost')
     a.add_argument('--port', type=int, default=7777)
+    a.add_argument('--profile', default='default', help='Hermes profile name when TYPE is hermes')
     a.add_argument('--always', action='store_true', help='Respond to all messages')
     a.add_argument('--always-all', action='store_true', help='Respond to all messages including agent output (unsafe)')
     a.add_argument('--resume', default=None, metavar='SESSION_ID', help='Resume a prior session by ID')

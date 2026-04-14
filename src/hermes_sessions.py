@@ -19,14 +19,14 @@ HERMES_BIN = HERMES_HOME / "bin" / "hermes"
 
 def normalize_hermes_profile(profile: str) -> str:
     normalized = (profile or "").strip().lower()
-    if normalized in ("", "default", "cassette"):
-        return "cassette"
+    if normalized in ("", "default", "hermes"):
+        return "default"
     return normalized
 
 
 def hermes_session_dir(profile: str) -> Path:
     normalized = normalize_hermes_profile(profile)
-    if normalized == "cassette":
+    if normalized == "default":
         return HERMES_HOME / "sessions"
     return HERMES_HOME / "profiles" / normalized / "sessions"
 

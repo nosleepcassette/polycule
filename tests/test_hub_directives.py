@@ -208,6 +208,28 @@ class HubDirectiveTests(unittest.IsolatedAsyncioTestCase):
         maps_writer.close()
         await maps_writer.wait_closed()
 
+    async def test_duplicate_backend_connection_replaces_old_agent(self):
+        maps_reader, maps_writer = await self._connect("maps", "human")
+        old_reader, old_writer = await self._connect("wizard", "hermes")
+        new_reader, new_writer = await self._connect("wizard", "hermes")
+
+        agents = self.server.status_payload()["agents"]
+        wizard_agents = [
+            item for item in agents
+            if item["name"] == "wizard" and item["type"] == "hermes"
+        ]
+        self.assertEqual(1, len(wizard_agents))
+
+        old_data = await asyncio.wait_for(old_reader.readline(), timeout=1.0)
+        self.assertEqual(b"", old_data)
+
+        maps_writer.close()
+        old_writer.close()
+        new_writer.close()
+        await maps_writer.wait_closed()
+        await old_writer.wait_closed()
+        await new_writer.wait_closed()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -246,6 +246,7 @@ class MessageRouter:
         if room_id not in self.rooms:
             raise KeyError(f"Room not found: {room_id}")
         room = self.rooms[room_id]
+        self._drop_duplicate_backend_agent(room, agent)
         room.agents[agent.id] = agent
         self.agents[agent.id] = agent
         logger.info(f"Agent joined: {agent.name} ({agent.id}) → room {room_id}")
@@ -262,6 +263,31 @@ class MessageRouter:
             exclude_ids=[agent.id],
         )
         return room
+
+    def _drop_duplicate_backend_agent(self, room: Room, agent: Agent):
+        """Keep at most one live backend connection per agent name/type in a room."""
+        if agent.type == "human":
+            return
+        name = agent.name.strip().lower()
+        agent_type = agent.type.strip().lower()
+        for existing in list(room.agents.values()):
+            if existing.id == agent.id:
+                continue
+            if existing.type.strip().lower() != agent_type:
+                continue
+            if existing.name.strip().lower() != name:
+                continue
+            logger.warning(
+                "Replacing duplicate backend agent connection: %s (%s) old=%s new=%s",
+                agent.name,
+                agent.type,
+                existing.id,
+                agent.id,
+            )
+            room.agents.pop(existing.id, None)
+            self.agents.pop(existing.id, None)
+            if existing.handle and not existing.handle.is_closing():
+                existing.handle.close()
 
     def leave_room(self, room_id: str, agent_id: str):
         if room_id not in self.rooms:

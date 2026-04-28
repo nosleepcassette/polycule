@@ -313,9 +313,9 @@ def _mode_off_notice_command(agent_name: str) -> str:
     return f"echo {shlex.quote(msg)}"
 
 
-def _find_named_panes(label: str) -> list[str]:
+def _find_named_panes(label: str, session_name: str = 'polycule') -> list[str]:
     result = subprocess.run(
-        ['tmux', 'list-panes', '-a', '-F', '#{pane_id}:#{@name}'],
+        ['tmux', 'list-panes', '-a', '-F', '#{session_name}:#{pane_id}:#{@name}'],
         capture_output=True,
         text=True,
     )
@@ -324,10 +324,12 @@ def _find_named_panes(label: str) -> list[str]:
 
     pane_ids = []
     for line in result.stdout.strip().splitlines():
-        parts = line.split(':', 1)
-        if len(parts) != 2:
+        parts = line.split(':', 2)
+        if len(parts) != 3:
             continue
-        pane_id, pane_label = parts[0], parts[1].strip().lower()
+        pane_session, pane_id, pane_label = parts[0], parts[1], parts[2].strip().lower()
+        if pane_session != session_name:
+            continue
         if pane_label == label.lower():
             pane_ids.append(pane_id)
     return pane_ids
@@ -568,7 +570,11 @@ def _set_agent_mode(agent_name: str, mode: str, room: str):
     except Exception:
         pass
     disabled = _load_disabled_agents()
-    _set_agent_runtime_state(agent_name, enabled=(agent_name not in disabled), room=room, modes=modes)
+    enabled = agent_name not in disabled
+    panes = _find_named_panes(agent_name)
+    active = any(_pane_active(pane_id) for pane_id in panes)
+    if not enabled or normalized == 'off' or not active:
+        _set_agent_runtime_state(agent_name, enabled=enabled, room=room, modes=modes)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +634,20 @@ def cmd_start(args):
 
     if hub_pane:
         if _hub_reachable(args.host, args.port):
-            print(f"  Hub already reachable on {args.host}:{args.port}; not restarting")
+            hub_status = asyncio.run(_hub_status_payload(args.host, args.port))
+            if hub_status:
+                print(f"  Hub already reachable on {args.host}:{args.port}; not restarting")
+            else:
+                print(
+                    f"  Error: something is listening on {args.host}:{args.port}, "
+                    "but it did not answer the Polycule status protocol.",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Stop the stale process or start with a different --port before launching.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
         else:
             hub_cmd = (
                 f'cd {shlex.quote(str(PROJECT_DIR))} && '

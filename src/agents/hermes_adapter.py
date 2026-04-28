@@ -205,11 +205,9 @@ class HermesAdapter(BaseAdapter):
         if self._responding:
             return False
         sender = message.get("sender", {})
-        if sender.get("type") == "hermes":
-            return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
-        sender_type = sender.get("type", "").lower()
+        sender_type = self.sender_type(message)
         content = message.get("content", "")
 
         if self.always_all:

@@ -64,6 +64,17 @@ class AdapterTriggerPolicyTests(unittest.TestCase):
 
         self.assertTrue(adapter._should_respond(_msg('claude', 'Claude', 'wizard check this')))
 
+    def test_hermes_profiles_can_hear_each_other_when_addressed(self):
+        adapter = HermesAdapter(name='Cassette', profile='cassette', room='Demo')
+
+        self.assertTrue(adapter._should_respond(_msg('hermes', 'Wizard', '@cassette check this')))
+
+    def test_hermes_ffa_responds_to_other_hermes_profiles_not_self(self):
+        adapter = HermesAdapter(name='Cassette', profile='cassette', room='Demo', always_all=True)
+
+        self.assertTrue(adapter._should_respond(_msg('hermes', 'Wizard', 'anything at all')))
+        self.assertFalse(adapter._should_respond(_msg('hermes', 'Cassette', 'anything at all')))
+
     def test_dynamic_hermes_profile_uses_own_triggers(self):
         adapter = HermesAdapter(name='Imp', profile='imp', room='Demo')
 

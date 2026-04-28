@@ -3,23 +3,30 @@
 ![Polycule Screenshot 1](screen1.png)
 ![Polycule Screenshot 2](screen2.png)
 
-Polycule is a local multi-agent terminal workspace. It gives you a tmux layout, a local hub, an IRC-style chat TUI, and one shared room where multiple agent CLIs can talk to each other in real time.
+Polycule is a local multi-agent terminal workspace. It gives you a tmux layout,
+a local TCP hub, an IRC-style chat TUI, and one shared room where multiple agent
+CLIs can talk to each other in real time.
 
 The public release is machine-adaptive:
 
 - Hermes profiles are discovered from `~/.hermes`
 - the default Hermes profile is exposed as `@hermes`
 - named Hermes profiles are exposed as `@<profile>`
-- external CLIs such as Codex, Claude Code, OpenCode, and Gemini are added when they are installed
+- Codex, Claude Code, OpenCode, and Gemini are added when their CLIs are installed
+- missing or disabled agents still get panes with clear status text
 
-## Features
+## Highlights
 
 - Local TCP hub with SQLite-backed room history
-- IRC-style TUI with reconnect, themes, search, pinning, topic, and slash commands
-- tmux layout with `polycule`, `swarm`, and `backend` windows
-- Dynamic backend roster based on the user's machine
-- Session reuse for Hermes, Codex, Claude, OpenCode, and Gemini when their CLIs support it
-- Agent controls for enable, disable, mode, summon, brief, watch, stand down, and roll call
+- tmux workspace with `polycule`, `swarm`, and `backend` windows
+- Dynamic backend roster based on local config and installed CLIs
+- First-run config writer plus `polycule.toml` / global config support
+- Health/status/kill commands for hub, panes, and configured agents
+- Session reuse for Hermes, Codex, Claude, OpenCode, and Gemini where supported
+- Runtime agent controls: enable, disable, modes, summon, brief, watch, stand down
+- TUI features: search, topics, pins, aliases, themes, reconnect, and slash commands
+- Keyboard UX: history, clear-line, slash completion, and filesystem path completion
+- Cost-aware routing helpers: `/which`, `/free`, and free/paid agent tags
 
 ## Requirements
 
@@ -29,9 +36,9 @@ The public release is machine-adaptive:
 - `fzf` is optional but improves tmux session selection
 - At least one agent CLI you want to run
 
-Polycule does not install agent CLIs for you. It discovers tools already
-available on your machine and keeps missing or disabled backends visible as
-inactive panes instead of failing the whole workspace.
+Polycule wraps existing standalone CLI tools. It does not install agent CLIs for
+you. Each enabled backend must already be installed and runnable as its own
+command.
 
 Supported backends:
 
@@ -50,14 +57,10 @@ uv sync
 export PATH="$HOME/dev/polycule/bin:$PATH"
 ```
 
-Add that `PATH` line to your shell profile if you want `polycule` available in new terminals.
-You can also run commands with `uv run polycule ...`.
+Add that `PATH` line to your shell profile if you want `polycule` available in
+new terminals. You can also run commands with `uv run polycule ...`.
 
-## First Run
-
-On first start, Polycule writes a local configuration if none exists. The config
-can live at `polycule.toml` in the project root or at
-`~/.config/polycule/config.toml`.
+## Quick Start
 
 Inspect the backend roster Polycule discovered on your machine:
 
@@ -65,31 +68,117 @@ Inspect the backend roster Polycule discovered on your machine:
 polycule agent status
 ```
 
-Then start the workspace:
+Start the workspace:
 
 ```bash
 polycule start --name "$USER" --room Main
 ```
 
-For a quick readiness check without attaching to tmux, run:
+For a quick readiness check without attaching to tmux:
 
 ```bash
 polycule status --json
 ```
 
-That command will:
+`polycule start` will:
 
-- create or reuse the `polycule` tmux session, prompting before replacing an existing one
-- reconcile the default layout
-- start the hub
+- create a default config if no config exists
+- create or reuse the `polycule` tmux session
+- prompt before replacing an existing session
+- reconcile the default tmux layout
+- start the hub and wait for readiness
 - start the chat TUI
-- start every configured backend pane, with disabled/missing agents showing an inline notice
+- start every configured backend pane
+- show inline notices for disabled, off-mode, or missing agents
 
-If you do not want Polycule to attach immediately:
+Run in the background without attaching:
 
 ```bash
 polycule start --background
 ```
+
+If a `polycule` tmux session already exists, use:
+
+```bash
+polycule start --attach
+polycule start --restart
+polycule start --fresh
+```
+
+## Configuration
+
+On first start, Polycule writes a local configuration if none exists. Config can
+live in either place:
+
+- `polycule.toml` in the project root for project-local settings
+- `~/.config/polycule/config.toml` for machine-global defaults
+
+Configuration priority is:
+
+1. `polycule.toml` in the project root
+2. `~/.config/polycule/config.toml`
+3. environment variables
+4. CLI flags
+
+See [`polycule.toml.example`](polycule.toml.example) for the full schema.
+
+Minimal shape:
+
+```toml
+[operator]
+name = "you"
+room = "Default"
+
+[hub]
+host = "localhost"
+port = 7777
+hub_timeout = 10.0
+
+[theme]
+name = "amber"
+
+[agents.hermes]
+enabled = true
+mode = "always"
+alias = "Hermes"
+
+[agents.codex]
+enabled = false
+mode = "mention"
+alias = "Codex"
+
+[autocomplete]
+max_file_candidates = 60
+show_hidden = true
+```
+
+Useful environment overrides:
+
+- `POLYCULE_HERMES_PROFILES=default,planner,analyst`
+  Restrict Hermes discovery to an explicit list.
+- `POLYCULE_HERMES_EXCLUDE_PROFILES=old-profile`
+  Exclude specific Hermes profiles.
+- `POLYCULE_HERMES_DEFAULT_NAME=guide`
+  Rename the default Hermes profile from `hermes`.
+- `POLYCULE_HERMES_ALWAYS_PROFILES=analyst`
+  Put specific Hermes profiles in `always` mode by default.
+- `POLYCULE_HERMES_MENTION_PROFILES=default`
+  Put specific Hermes profiles in `mention` mode by default.
+- `POLYCULE_EXTERNAL_AGENTS=codex,claude,opencode,gemini`
+  Restrict which external agent families Polycule manages.
+
+Adapter-specific overrides:
+
+- `POLYCULE_CODEX_DANGEROUS_BYPASS=1`
+- `POLYCULE_CODEX_ADD_DIRS="$HOME/.hermes:$HOME/.codex"`
+- `POLYCULE_CLAUDE_BYPASS_PERMISSIONS=1`
+- `POLYCULE_CLAUDE_ALLOWED_TOOLS="Bash,Read,Write,Edit"`
+- `POLYCULE_CLAUDE_PERMISSION_MODE="bypassPermissions"`
+- `POLYCULE_GEMINI_STATUS_CMD="python3 ~/scripts/agent-status.py"`
+
+Permission-bypass flags are off by default in the public repo. Only set the
+adapter-specific override variables when you intentionally want those CLI tools
+to run with broader local permissions.
 
 ## Discovery
 
@@ -111,52 +200,62 @@ the discovered Hermes agents will be:
 - `@analyst`
 
 Installed external CLIs are added alongside those Hermes agents when available.
+External agents are listed in public config but disabled by default until you
+enable them in config or at runtime.
 
-Default response modes:
+## Agent Skills
 
-- the default Hermes profile starts in `always`
-- discovered Hermes profiles start in `mention` unless configured otherwise
-- external CLIs are listed but disabled until enabled in config or at runtime
-- `claude`, `opencode`, and `gemini` start in `mention`
+Polycule keeps lightweight capability hints for managed agents. The TUI uses
+those hints for `/which <task>` and labels choices as `[free]` or `[paid]`.
 
-You can change any of that at runtime with `polycule agent mode <agent> <mention|always|handoff|ffa|off>`.
+Built-in routing hints:
 
-## Overrides
+- Hermes: local, general-purpose agent from `~/.hermes`
+- Hermes profiles with names like `planner`, `research`, `docs`, or `writer`:
+  planning, docs, review, synthesis
+- Hermes profiles with names like `ops`, `shell`, `tmux`, or `infra`:
+  terminal, pane, session, operations
+- Codex: code implementation, patches, debugging, refactors, tests `[paid]`
+- Claude: review, writing, architecture, explanation, synthesis `[paid]`
+- OpenCode: local code-focused backup path
+- Gemini: research, analysis, explanation, broad synthesis `[paid]`
 
-Configuration priority is:
+Inside the TUI:
 
-1. `polycule.toml` in the project root
-2. `~/.config/polycule/config.toml`
-3. environment variables
-4. CLI flags
+```text
+/which refactor the hub shutdown path
+/free
+```
 
-See `polycule.toml.example` for the full schema. Environment variables still work:
+`/which` scores enabled agents against the task. `/free` toggles free mode, which
+keeps local/non-premium agents active and disables paid agents until you toggle it
+off.
 
-- `POLYCULE_HERMES_PROFILES=default,planner,analyst`
-  Restrict Hermes discovery to an explicit list.
-- `POLYCULE_HERMES_EXCLUDE_PROFILES=old-profile`
-  Exclude specific Hermes profiles.
-- `POLYCULE_HERMES_DEFAULT_NAME=guide`
-  Rename the default Hermes profile from `hermes` to another public-facing agent name.
-- `POLYCULE_HERMES_ALWAYS_PROFILES=analyst`
-  Force specific Hermes profiles into `always` mode on first discovery.
-- `POLYCULE_HERMES_MENTION_PROFILES=default`
-  Force specific Hermes profiles into `mention` mode on first discovery.
-- `POLYCULE_EXTERNAL_AGENTS=codex,claude,opencode,gemini`
-  Restrict which external agent families Polycule manages.
+## Response Modes
 
-Optional adapter-specific overrides:
+Each agent has a runtime response mode:
 
-- `POLYCULE_CODEX_DANGEROUS_BYPASS=1`
-- `POLYCULE_CODEX_ADD_DIRS="$HOME/.hermes:$HOME/.codex"`
-- `POLYCULE_CLAUDE_BYPASS_PERMISSIONS=1`
-- `POLYCULE_CLAUDE_ALLOWED_TOOLS="Bash,Read,Write,Edit"`
-- `POLYCULE_CLAUDE_PERMISSION_MODE="bypassPermissions"`
-- `POLYCULE_GEMINI_STATUS_CMD="python3 ~/scripts/agent-status.py"`
+- `off`: keep the pane visible but do not run the adapter
+- `mention`: respond to explicit mentions such as `@codex`
+- `always`: respond to human messages in the room
+- `handoff`: allow agent-to-agent plaintext handoffs in addition to mentions
+- `ffa`: free-for-all mode; respond to all messages, useful but easy to overdo
 
-Permission-bypass flags are off by default in the public repo. Only set the
-adapter-specific override variables when you intentionally want those CLI
-tools to run with broader local permissions.
+Change modes from the shell:
+
+```bash
+polycule agent mode codex mention
+polycule agent enable codex
+polycule agent disable claude
+```
+
+Or from the chat TUI:
+
+```text
+/mode codex mention
+/enable codex
+/disable claude
+```
 
 ## Layout
 
@@ -166,14 +265,14 @@ Default tmux windows:
 - `swarm`: one spare worker pane
 - `backend`: `hub-log | <one pane per discovered backend agent>`
 
-If a `polycule` tmux session already exists, `polycule start` prompts to attach,
-restart, or quit. Use `--attach`, `--restart`, or `--fresh` to skip the prompt.
+Backend panes are dynamic. If your config exposes `hermes`, `codex`, `claude`,
+`opencode`, `gemini`, and a `planner` Hermes profile, each gets its own backend
+pane. Disabled or missing agents are deliberately visible so the layout explains
+what is and is not running.
 
-## Using It
+## TUI Commands
 
-Inside the chat pane, type naturally and mention the agent you want.
-
-Examples:
+Inside the chat pane, type naturally and mention the agent you want:
 
 ```text
 @hermes summarize the room
@@ -182,9 +281,19 @@ Examples:
 @analyst compare these two approaches
 ```
 
-Useful slash commands:
+Room and navigation:
 
 - `/help`
+- `/room <name>`
+- `/rooms`
+- `/join <name>`
+- `/topic [text]`
+- `/search <query>`
+- `/clear`
+- `/quit`
+
+Agent controls:
+
 - `/agents`
 - `/modes`
 - `/mode <agent> <mention|always|handoff|ffa|off>`
@@ -194,14 +303,32 @@ Useful slash commands:
 - `/brief <all|agent...> -- <message>`
 - `/standdown <all|agent...>`
 - `/watch <agent|all> <off|human|room|@agent>`
+- `/cancel`, `/detrigger`, `/stop`
 - `/rollcall`
-- `/theme amber`
+
+Routing and cost controls:
+
+- `/which <task>`
+- `/free`
+- `/free-mode`
+
+Memory and display:
+
 - `/pin <message_id|prefix|last>`
 - `/unpin <message_id|prefix>`
-- `/which <task>`
+- `/pins`
+- `/rename me <name>`
+- `/rename <agent> <name>`
+- `/theme <default|amber|matrix|monokai>`
+- `/themes`
+
+Runtime controls:
+
 - `/restart`
 - `/restart --full`
-- `/quit`
+- `/restart --full --now`
+- `/restart hub`
+- `/quit --now`
 
 Keyboard shortcuts:
 
@@ -212,7 +339,12 @@ Keyboard shortcuts:
 - `Ctrl-C`: clear the input line, or show a `/quit` hint if empty
 - `Ctrl-L`: clear the chat view
 
+Persisted room state includes history, last room, topic, pins, display aliases,
+theme choice, response modes, watch state, and adapter session IDs.
+
 ## CLI Reference
+
+Launch:
 
 ```bash
 polycule start
@@ -222,11 +354,22 @@ polycule start --restart
 polycule start --fresh
 polycule hub
 polycule tui --name "$USER"
+```
+
+Inspect and stop:
+
+```bash
 polycule status
 polycule status --json
 polycule kill
+polycule kill --now
 polycule kill --hub-only
 polycule kill --panes-only
+```
+
+Manage agents:
+
+```bash
 polycule agent status
 polycule agent modes
 polycule agent enable <agent>
@@ -236,13 +379,20 @@ polycule agent hermes --room Main
 polycule agent <discovered-hermes-agent> --room Main
 polycule agent codex --room Main
 polycule agent claude --room Main
+polycule agent opencode --room Main
+polycule agent gemini --room Main
+```
+
+Approval mode:
+
+```bash
 polycule approve on
 polycule approve off
 ```
 
 ## Custom Agents
 
-For tools that just read stdin and write stdout, use the shell adapter directly:
+For tools that read stdin and write stdout, use the shell adapter directly:
 
 ```bash
 python3 src/agents/shell_adapter.py \
@@ -251,13 +401,32 @@ python3 src/agents/shell_adapter.py \
   --room Main
 ```
 
-If you want a custom adapter, subclass [`BaseAdapter`](src/agents/base_adapter.py) and implement your own response logic.
+If you want a custom adapter, subclass [`BaseAdapter`](src/agents/base_adapter.py)
+and implement your own response logic. Existing adapters all share the same hub
+protocol, reconnect handling, directive support, queueing, and mode/watch
+behavior.
+
+## Development
+
+```bash
+uv sync
+uv run pytest -q
+uv run polycule status --json
+```
+
+The package exposes a `polycule` script through `pyproject.toml`, while
+`bin/polycule` remains available for direct checkout-based use.
 
 ## Caveats
 
 - This is a local-first tool. There is no auth layer on the hub.
-- Structural tmux actions go through the approval flow, but only part of the tmux command surface is implemented.
-- The repo intentionally ignores runtime state, logs, database files, and internal handoff artifacts so they do not leak into the public branch.
+- The hub listens on localhost by default; keep it that way unless you know why
+  you are exposing it.
+- Structural tmux actions go through the approval flow, but only part of the tmux
+  command surface is implemented.
+- `ffa` and permission bypass settings are intentionally sharp tools.
+- The repo ignores runtime state, logs, database files, local config, and
+  handoff artifacts so they do not leak into the public branch.
 
 ## License
 

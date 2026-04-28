@@ -1,19 +1,14 @@
-import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-
-os.environ["POLYCULE_HERMES_PROFILES"] = "cassette,wizard"
-os.environ["POLYCULE_INCLUDE_UNAVAILABLE_HERMES"] = "1"
-os.environ["POLYCULE_EXTERNAL_AGENTS"] = "codex,claude,opencode,gemini"
-os.environ["POLYCULE_INCLUDE_UNAVAILABLE_EXTERNALS"] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ui.chat_tui import ChatTUI
+from ui.chat_tui import BACKEND_AGENTS, ChatTUI
 
 
 class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
@@ -39,7 +34,7 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         await tui._handle_slash('ahelp')
         joined = '\n'.join(self._walker_text(tui)).lower()
         self.assertIn('slash commands:', joined)
-        self.assertIn('/mode <agent> <mention|always|off>', joined)
+        self.assertIn('/mode <agent|all> <mention|always|handoff|ffa|off>', joined)
 
     async def test_tab_completion_completes_enable(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
@@ -59,31 +54,37 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tab_completion_completes_mode_arguments(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
-        tui.edit.set_edit_text('/mode wi')
-        tui.edit.edit_pos = len('/mode wi')
+        tui.edit.set_edit_text('/mode he')
+        tui.edit.edit_pos = len('/mode he')
         ok = tui._complete_slash_command()
         self.assertTrue(ok)
-        self.assertEqual('/mode wizard ', tui.edit.get_edit_text())
+        self.assertEqual('/mode hermes ', tui.edit.get_edit_text())
 
-        tui.edit.set_edit_text('/mode wizard a')
-        tui.edit.edit_pos = len('/mode wizard a')
+        tui.edit.set_edit_text('/mode hermes a')
+        tui.edit.edit_pos = len('/mode hermes a')
         ok = tui._complete_slash_command()
         self.assertTrue(ok)
-        self.assertEqual('/mode wizard always', tui.edit.get_edit_text())
+        self.assertEqual('/mode hermes always', tui.edit.get_edit_text())
+
+        tui.edit.set_edit_text('/mode hermes ha')
+        tui.edit.edit_pos = len('/mode hermes ha')
+        ok = tui._complete_slash_command()
+        self.assertTrue(ok)
+        self.assertEqual('/mode hermes handoff', tui.edit.get_edit_text())
 
     async def test_tab_completion_completes_watch_arguments(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
-        tui.edit.set_edit_text('/watch wi')
-        tui.edit.edit_pos = len('/watch wi')
+        tui.edit.set_edit_text('/watch he')
+        tui.edit.edit_pos = len('/watch he')
         ok = tui._complete_slash_command()
         self.assertTrue(ok)
-        self.assertEqual('/watch wizard ', tui.edit.get_edit_text())
+        self.assertEqual('/watch hermes ', tui.edit.get_edit_text())
 
-        tui.edit.set_edit_text('/watch wizard ro')
-        tui.edit.edit_pos = len('/watch wizard ro')
+        tui.edit.set_edit_text('/watch hermes ro')
+        tui.edit.edit_pos = len('/watch hermes ro')
         ok = tui._complete_slash_command()
         self.assertTrue(ok)
-        self.assertEqual('/watch wizard room', tui.edit.get_edit_text())
+        self.assertEqual('/watch hermes room', tui.edit.get_edit_text())
 
     async def test_tab_completion_completes_theme_argument(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
@@ -107,18 +108,78 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual('/approve abc123', tui.edit.get_edit_text())
 
+    async def test_file_completion_completes_absolute_path(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            target = path / 'notes.md'
+            target.write_text('hello', encoding='utf-8')
+            typed = f'open {path}/no'
+            tui.edit.set_edit_text(typed)
+            tui.edit.edit_pos = len(typed)
+
+            ok = tui._complete_file_path()
+
+            self.assertTrue(ok)
+            self.assertEqual(f'open {target} ', tui.edit.get_edit_text())
+
+    async def test_ctrl_c_clears_input_instead_of_exiting(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        tui.edit.set_edit_text('draft message')
+        tui.edit.edit_pos = len('draft message')
+
+        tui.handle_input('ctrl c')
+
+        self.assertEqual('', tui.edit.get_edit_text())
+
     async def test_mode_command_calls_cli(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
         calls = []
 
         async def fake_run(*args):
             calls.append(args)
-            return 0, 'Set mode wizard=always', ''
+            return 0, 'Set mode hermes=always', ''
 
         tui._run_polycule_cli = fake_run  # type: ignore[assignment]
-        await tui._handle_slash('mode wizard always')
-        self.assertEqual([('agent', 'mode', 'wizard', 'always')], calls)
-        self.assertIn('set mode wizard=always', self._walker_text(tui)[-1].lower())
+        await tui._handle_slash('mode hermes always')
+        self.assertEqual([('agent', 'mode', 'hermes', 'always')], calls)
+        self.assertIn('set mode hermes=always', self._walker_text(tui)[-1].lower())
+
+    async def test_mode_command_accepts_all_target_and_alias(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        calls = []
+
+        async def fake_run(*args):
+            calls.append(args)
+            return 0, f'Set mode {args[2]}=ffa', ''
+
+        tui._run_polycule_cli = fake_run  # type: ignore[assignment]
+        await tui._handle_slash('mode all free')
+        self.assertEqual(
+            [('agent', 'mode', agent, 'ffa') for agent in BACKEND_AGENTS],
+            calls,
+        )
+
+    async def test_cancel_command_sends_hub_command(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        tui.room_id = 'room-1'
+        sent = []
+
+        async def fake_send(payload):
+            sent.append(payload)
+            return True
+
+        tui._send = fake_send  # type: ignore[assignment]
+        await tui._handle_slash('cancel codex')
+        self.assertEqual(
+            {
+                'type': 'command',
+                'command': 'cancel_response',
+                'room_id': 'room-1',
+                'targets': ['codex'],
+            },
+            sent[0],
+        )
 
     async def test_agent_status_system_event_renders(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
@@ -139,13 +200,13 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         await tui._handle_incoming({
             'type': 'system',
             'action': 'agent_session',
-            'agent_name': 'cassette',
+            'agent_name': 'hermes',
             'state': 'created',
             'session_id': 'sess-123',
             'session_title': 'chat',
         })
         self.assertEqual(before + 1, len(tui.walker))
-        self.assertIn('cassette session ready', self._walker_text(tui)[-1].lower())
+        self.assertIn('hermes session ready', self._walker_text(tui)[-1].lower())
         self.assertIn('sess-123', self._walker_text(tui)[-1])
 
     async def test_theme_command_applies_requested_theme(self):
@@ -161,6 +222,52 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([('phosphor', True)], calls)
         self.assertIn('theme: amber', self._walker_text(tui)[-1].lower())
 
+    async def test_search_command_surfaces_matching_message_ids(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        tui.add_message(
+            {
+                'id': 'msg-alpha',
+                'type': 'message',
+                'content': 'Need a retry-safe reconnect strategy for the hub',
+                'sender': {'name': 'wizard', 'type': 'hermes'},
+                'timestamp': '2026-04-22T01:00:00',
+            }
+        )
+        tui.add_message(
+            {
+                'id': 'msg-beta',
+                'type': 'message',
+                'content': 'Unrelated note about themes',
+                'sender': {'name': 'maps', 'type': 'human'},
+                'timestamp': '2026-04-22T01:01:00',
+            }
+        )
+
+        await tui._handle_slash('search reconnect')
+
+        joined = '\n'.join(self._walker_text(tui)).lower()
+        self.assertIn("search: 1 match(es) for 'reconnect'", joined)
+        self.assertIn('[msg-alpha] wizard: need a retry-safe reconnect strategy', joined)
+
+    async def test_pin_command_accepts_message_id_prefix(self):
+        tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
+        tui.add_message(
+            {
+                'id': 'msg-12345678',
+                'type': 'message',
+                'content': 'Pin this concrete message for follow-up',
+                'sender': {'name': 'codex', 'type': 'codex'},
+                'timestamp': '2026-04-22T01:02:00',
+            }
+        )
+
+        await tui._handle_slash('pin msg-1234')
+        await tui._handle_slash('pins')
+
+        joined = '\n'.join(self._walker_text(tui)).lower()
+        self.assertIn('pinned [msg-12345678] codex: pin this concrete message for follow-up', joined)
+        self.assertIn('pins: 1', joined)
+
     async def test_rollcall_sends_mentions_for_active_agents(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
         tui.room_id = 'room-1'
@@ -172,10 +279,9 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
                 0,
                 '\n'.join(
                     [
-                        'Enabled: cassette, wizard, codex, claude',
+                        'Enabled: hermes, codex, claude',
                         'Disabled: opencode, gemini',
-                        'cassette: state=enabled mode=always',
-                        'wizard: state=enabled mode=always',
+                        'hermes: state=enabled mode=always',
                         'codex: state=enabled mode=always',
                         'claude: state=enabled mode=mention',
                         'opencode: state=disabled mode=mention',
@@ -195,12 +301,11 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         await tui._handle_slash('rollcall')
 
         self.assertEqual(1, len(sent))
-        self.assertIn('@cassette', sent[0]['content'])
-        self.assertIn('@wizard', sent[0]['content'])
+        self.assertIn('@hermes', sent[0]['content'])
         self.assertIn('@codex', sent[0]['content'])
         self.assertIn('@claude', sent[0]['content'])
         self.assertNotIn('@opencode', sent[0]['content'])
-        self.assertIn('rollcall: cassette, wizard, codex, claude', self._walker_text(tui)[-1].lower())
+        self.assertIn('rollcall: hermes, codex, claude', self._walker_text(tui)[-1].lower())
 
     async def test_which_recommends_codex_for_code_task(self):
         tui = ChatTUI(name='maps', room='Demo', host='localhost', port=7777)
@@ -211,8 +316,7 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
                 0,
                 '\n'.join(
                     [
-                        'cassette: state=enabled mode=always',
-                        'wizard: state=enabled mode=always',
+                        'hermes: state=enabled mode=always',
                         'codex: state=enabled mode=always',
                         'claude: state=enabled mode=mention',
                         'opencode: state=enabled mode=mention',
@@ -238,13 +342,13 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
             return True
 
         tui._send = fake_send  # type: ignore[assignment]
-        await tui._handle_slash('watch wizard room')
+        await tui._handle_slash('watch hermes room')
         self.assertEqual(
             {
                 'type': 'command',
                 'command': 'set_watch',
                 'room_id': 'room-1',
-                'watchers': ['wizard'],
+                'watchers': ['hermes'],
                 'scope': 'room',
                 'target': '',
             },
@@ -264,10 +368,9 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
                     0,
                     '\n'.join(
                         [
-                            'wizard: state=enabled mode=always',
+                            'hermes: state=enabled mode=always',
                             'codex: state=disabled mode=always',
                             'claude: state=enabled mode=mention',
-                            'cassette: state=enabled mode=always',
                             'opencode: state=enabled mode=mention',
                             'gemini: state=enabled mode=mention',
                         ]
@@ -285,12 +388,12 @@ class ChatTUICommandTests(unittest.IsolatedAsyncioTestCase):
         tui._run_polycule_cli = fake_cli  # type: ignore[assignment]
         tui._send = fake_send  # type: ignore[assignment]
         tui._mark_temporary_enablements = lambda agents, reason: None  # type: ignore[assignment]
-        await tui._handle_slash('brief wizard codex -- internalize the new docs')
+        await tui._handle_slash('brief hermes codex -- internalize the new docs')
 
         self.assertIn(('agent', 'status'), calls)
         self.assertIn(('agent', 'enable', 'codex'), calls)
         self.assertEqual('send_directive', sent[0]['command'])
-        self.assertEqual(['wizard', 'codex'], sent[0]['targets'])
+        self.assertEqual(['hermes', 'codex'], sent[0]['targets'])
         self.assertEqual('internalize the new docs', sent[0]['content'])
 
     async def test_standdown_restores_previous_mode_and_disabled_state(self):

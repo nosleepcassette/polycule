@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Claude Code Adapter for Polycule Hub
 
@@ -37,14 +37,9 @@ MENTION_TRIGGERS = frozenset({"@claude"})
 HUMAN_WORD_TRIGGERS = frozenset({"claude"})
 
 SYSTEM_PROMPT = """You are Claude, an AI assistant participating in the Polycule \
-multi-agent workspace. You are collaborating with the human operator, Wizard (a Hermes agent), \
-and potentially Codex. Be helpful, concise, and direct. Respond only to messages \
-directed at you or when your input is clearly needed."""
-
-
-def _env_truthy(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+multi-agent workspace. You are collaborating with a human operator and any other \
+agents in the room. Be helpful, concise, and direct. Respond only to messages \
+directed at you or when your response mode/watch policy says to."""
 
 
 class ClaudeAdapter(BaseAdapter):
@@ -58,6 +53,7 @@ class ClaudeAdapter(BaseAdapter):
         hub_port: int = 7777,
         always_respond: bool = False,
         always_all: bool = False,
+        agent_handoffs: bool = False,
         model: str = "claude-sonnet-4-6",
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
@@ -72,6 +68,7 @@ class ClaudeAdapter(BaseAdapter):
         super().__init__(config)
         self.always_respond = always_respond
         self.always_all = always_all
+        self.agent_handoffs = agent_handoffs
         self.model = model
         self.resume_session = resume_session
         self._responding = False
@@ -86,20 +83,25 @@ class ClaudeAdapter(BaseAdapter):
             self.session_title = get_or_allocate_agent_session_title(self.session_key)
 
     def _build_cmd(self, prompt: str) -> list[str]:
-        cmd = ["claude", "-p", "--model", self.model]
-        if _env_truthy("POLYCULE_CLAUDE_BYPASS_PERMISSIONS"):
-            cmd.extend(
-                [
-                    "--dangerously-skip-permissions",
-                    "--permission-mode",
-                    os.environ.get("POLYCULE_CLAUDE_PERMISSION_MODE", "bypassPermissions"),
-                    "--allowedTools",
-                    os.environ.get(
-                        "POLYCULE_CLAUDE_ALLOWED_TOOLS",
-                        "Bash,Read,Write,Edit",
-                    ),
-                ]
-            )
+        cmd = [
+            "claude",
+            "-p",
+            "--model",
+            self.model,
+        ]
+        if os.environ.get("POLYCULE_CLAUDE_BYPASS_PERMISSIONS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            cmd.append("--dangerously-skip-permissions")
+        permission_mode = os.environ.get("POLYCULE_CLAUDE_PERMISSION_MODE", "").strip()
+        if permission_mode:
+            cmd.extend(["--permission-mode", permission_mode])
+        allowed_tools = os.environ.get("POLYCULE_CLAUDE_ALLOWED_TOOLS", "").strip()
+        if allowed_tools:
+            cmd.extend(["--allowedTools", allowed_tools])
         if self.resume_session:
             cmd.extend(["-r", self.resume_session])
         else:
@@ -251,7 +253,7 @@ class ClaudeAdapter(BaseAdapter):
             return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
-        sender_type = sender.get("type", "").lower()
+        sender_type = self.sender_type(message)
         content = message.get("content", "")
 
         if self.always_all:
@@ -263,7 +265,12 @@ class ClaudeAdapter(BaseAdapter):
 
         if sender_type == "human":
             return self.has_any_trigger(content, MENTION_TRIGGERS | HUMAN_WORD_TRIGGERS)
-        return self.has_any_trigger(content, MENTION_TRIGGERS)
+        return self.agent_message_matches(
+            content,
+            MENTION_TRIGGERS,
+            HUMAN_WORD_TRIGGERS,
+            allow_plaintext=self.agent_handoffs,
+        )
 
     async def _call_claude(self, prompt: str) -> Optional[str]:
         logger.info("Calling claude -p (%s chars)", len(prompt))
@@ -271,6 +278,8 @@ class ClaudeAdapter(BaseAdapter):
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
+            return
+        if not self._claim_response_message(message):
             return
 
         self._responding = True
@@ -282,6 +291,7 @@ class ClaudeAdapter(BaseAdapter):
             )
         try:
             prompt = self._build_prompt(message)
+            await self.set_typing(True)
             response = await self._call_claude(prompt)
             if response:
                 session_id, session_event = self._capture_session_id(session_snapshot)
@@ -291,11 +301,23 @@ class ClaudeAdapter(BaseAdapter):
                 message_id = str(message.get("id", "")).strip()
                 if message_id:
                     self._persist_session_state(last_message_id=message_id)
+        except asyncio.CancelledError:
+            detail = self.consume_cancel_reason() or "response cancelled"
+            logger.info("Claude response cancelled: %s", detail)
+            await self.send_status("cancelled", detail)
+            raise
         finally:
+            await self.set_typing(False)
             self._responding = False
 
     async def handle_context_dump(self, messages: list):
         logger.info("Claude context loaded: %s messages", len(messages))
+
+    def _on_mode_changed(self, mode: str):
+        self.always_respond = (mode == "always")
+        self.always_all = (mode == "ffa")
+        self.agent_handoffs = (mode == "handoff")
+        logger.info("%s mode updated → %s", self.config.name, mode)
 
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
@@ -312,6 +334,7 @@ class ClaudeAdapter(BaseAdapter):
         if isinstance(refs, list) and refs:
             content += "\n\nRefs:\n" + "\n".join(f"- {item}" for item in refs if item)
         synthetic = {
+            "id": f"directive:{directive_id or 'unknown'}:claude",
             "type": "message",
             "sender": {
                 "id": str(message.get("issued_by_id", "")),
@@ -320,7 +343,7 @@ class ClaudeAdapter(BaseAdapter):
             },
             "content": f"@claude directive ({message.get('directive_kind', 'brief')}):\n{content}",
         }
-        await self.handle_message(synthetic)
+        self._schedule_message_handling(synthetic)
 
 
 def main():
@@ -334,6 +357,11 @@ def main():
         "--always-all",
         action="store_true",
         help="Respond to all messages (unsafe: can trigger loops)",
+    )
+    parser.add_argument(
+        "--agent-handoffs",
+        action="store_true",
+        help="Allow agent-to-agent plaintext handoffs without @mentions",
     )
     parser.add_argument("--model", default="claude-sonnet-4-6")
     parser.add_argument("--session-title", default=None)
@@ -357,6 +385,7 @@ def main():
         hub_port=args.port,
         always_respond=args.always,
         always_all=args.always_all,
+        agent_handoffs=args.agent_handoffs,
         model=args.model,
         session_title=args.session_title,
         resume_session=args.resume,

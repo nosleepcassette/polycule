@@ -1,0 +1,55 @@
+# Polycule local configuration
+# Copy to polycule.toml for a project-local config, or use
+# ~/.config/polycule/config.toml as a machine-global fallback.
+#
+# polycule wraps existing standalone CLI tools. Each enabled agent must already
+# be installed and runnable as its own command. polycule does not install them.
+
+[operator]
+name = "you"
+room = "Default"
+
+[hub]
+host = "localhost"
+port = 7777
+hub_timeout = 10.0
+
+[theme]
+name = "amber" # default | amber | matrix | monokai
+
+[agents.hermes]
+enabled = true
+mode = "always"
+alias = "Hermes"
+
+[agents.codex]
+enabled = false
+mode = "mention"
+alias = "Codex"
+
+[agents.claude]
+enabled = false
+mode = "mention"
+alias = "Claude"
+
+[agents.opencode]
+enabled = false
+mode = "mention"
+alias = "OpenCode"
+
+[agents.gemini]
+enabled = false
+mode = "mention"
+alias = "Gemini"
+
+[hermes]
+home = ""
+profiles = []
+always_profiles = ["hermes"]
+
+[external]
+agents = []
+
+[autocomplete]
+max_file_candidates = 60
+show_hidden = true

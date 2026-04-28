@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Runtime state helpers backed by the local Polycule SQLite settings table.
 
@@ -197,7 +197,7 @@ def normalize_watch_scope(scope: Any, target: Any = "") -> tuple[str, str]:
     if normalized_scope in ("none", "off", "clear"):
         return "none", ""
     if normalized_scope in ("maps", "human"):
-        return "maps", "maps"
+        return "human", ""
     if normalized_scope == "room":
         return "room", ""
     if normalized_scope.startswith("@"):

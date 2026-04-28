@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Gemini CLI Adapter for Polycule Hub
 
@@ -17,7 +17,6 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from agents.base_adapter import AgentConfig, BaseAdapter
@@ -45,47 +44,9 @@ MENTION_TRIGGERS = frozenset({"@gemini"})
 HUMAN_WORD_TRIGGERS = frozenset({"gemini"})
 
 SYSTEM_PROMPT = """You are Gemini, an AI assistant participating in the Polycule \
-multi-agent workspace. You are collaborating with the human operator, Cassette, Wizard, \
-Codex, Claude, and other agents as needed. Be concise, direct, and technically precise. \
-Respond only when addressed or when your input is clearly requested."""
-
-
-def _maybe_run_startup_status_cmd():
-    raw = os.environ.get("POLYCULE_GEMINI_STATUS_CMD", "").strip()
-    if not raw:
-        return
-    try:
-        cmd = [os.path.expanduser(part) for part in shlex.split(raw)]
-    except ValueError as exc:
-        logger.warning("Invalid POLYCULE_GEMINI_STATUS_CMD: %s", exc)
-        return
-    if not cmd:
-        return
-    logger.info("Running Gemini startup status command: %s", " ".join(cmd))
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("Gemini startup status command timed out")
-        return
-    except Exception as exc:
-        logger.warning("Gemini startup status command failed: %s", exc)
-        return
-
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if stdout:
-        logger.info("Gemini startup status output:\n%s", stdout)
-    if result.returncode != 0:
-        logger.warning(
-            "Gemini startup status exited %s%s",
-            result.returncode,
-            f": {stderr}" if stderr else "",
-        )
+multi-agent workspace. You are collaborating with a human operator and any other \
+agents in the room. Be concise, direct, and technically precise. Respond only when \
+addressed or when your response mode/watch policy says to."""
 
 
 class GeminiAdapter(BaseAdapter):
@@ -99,6 +60,7 @@ class GeminiAdapter(BaseAdapter):
         hub_port: int = 7777,
         always_respond: bool = False,
         always_all: bool = False,
+        agent_handoffs: bool = False,
         model: str = "gemini-2.5-flash",
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
@@ -113,6 +75,7 @@ class GeminiAdapter(BaseAdapter):
         super().__init__(config)
         self.always_respond = always_respond
         self.always_all = always_all
+        self.agent_handoffs = agent_handoffs
         self.model = model
         self.resume_session = resume_session
         self.session_title = normalize_session_title(session_title)
@@ -281,7 +244,7 @@ class GeminiAdapter(BaseAdapter):
             return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
-        sender_type = sender.get("type", "").lower()
+        sender_type = self.sender_type(message)
         content = message.get("content", "")
 
         if self.always_all:
@@ -293,43 +256,24 @@ class GeminiAdapter(BaseAdapter):
 
         if sender_type == "human":
             return self.has_any_trigger(content, MENTION_TRIGGERS | HUMAN_WORD_TRIGGERS)
-        return self.has_any_trigger(content, MENTION_TRIGGERS)
+        return self.agent_message_matches(
+            content,
+            MENTION_TRIGGERS,
+            HUMAN_WORD_TRIGGERS,
+            allow_plaintext=self.agent_handoffs,
+        )
 
     async def _call_gemini(self, prompt: str) -> tuple[Optional[str], Optional[str]]:
         cmd = self._build_cmd(prompt)
         logger.info("Calling gemini -p (%s chars)", len(prompt))
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120.0,
-            )
-        except subprocess.TimeoutExpired:
-            logger.warning("Gemini subprocess timed out after 120s")
-            return None, None
-        except Exception as exc:
-            logger.warning("Gemini subprocess failed: %s", exc)
-            return None, None
-
-        stdout = (result.stdout or "").strip()
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
-            logger.warning(
-                "Gemini exited %s: %s",
-                result.returncode,
-                (stderr or stdout or "no stderr")[:200],
-            )
-            return None, None
-
-        if not stdout:
+        output = await self.run_subprocess(cmd, timeout=120.0)
+        if not output:
             return None, None
 
         try:
-            payload = json.loads(stdout)
+            payload = json.loads(output)
         except json.JSONDecodeError:
-            return stdout, None
+            return output, None
 
         response = str(payload.get("response", "")).strip()
         session_id = str(payload.get("session_id", "")).strip() or None
@@ -337,6 +281,8 @@ class GeminiAdapter(BaseAdapter):
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
+            return
+        if not self._claim_response_message(message):
             return
 
         self._responding = True
@@ -348,6 +294,7 @@ class GeminiAdapter(BaseAdapter):
             )
         try:
             prompt = self._build_prompt(message)
+            await self.set_typing(True)
             response, output_session_id = await self._call_gemini(prompt)
             session_id, session_event = self._capture_session_id(
                 session_snapshot,
@@ -362,11 +309,23 @@ class GeminiAdapter(BaseAdapter):
                     self._persist_session_state(last_message_id=message_id)
             else:
                 logger.warning("Gemini returned no response")
+        except asyncio.CancelledError:
+            detail = self.consume_cancel_reason() or "response cancelled"
+            logger.info("Gemini response cancelled: %s", detail)
+            await self.send_status("cancelled", detail)
+            raise
         finally:
+            await self.set_typing(False)
             self._responding = False
 
     async def handle_context_dump(self, messages: list):
         logger.info("Gemini context loaded: %s messages", len(messages))
+
+    def _on_mode_changed(self, mode: str):
+        self.always_respond = (mode == "always")
+        self.always_all = (mode == "ffa")
+        self.agent_handoffs = (mode == "handoff")
+        logger.info("%s mode updated → %s", self.config.name, mode)
 
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
@@ -383,6 +342,7 @@ class GeminiAdapter(BaseAdapter):
         if isinstance(refs, list) and refs:
             content += "\n\nRefs:\n" + "\n".join(f"- {item}" for item in refs if item)
         synthetic = {
+            "id": f"directive:{directive_id or 'unknown'}:gemini",
             "type": "message",
             "sender": {
                 "id": str(message.get("issued_by_id", "")),
@@ -391,7 +351,7 @@ class GeminiAdapter(BaseAdapter):
             },
             "content": f"@gemini directive ({message.get('directive_kind', 'brief')}):\n{content}",
         }
-        await self.handle_message(synthetic)
+        self._schedule_message_handling(synthetic)
 
 
 def main():
@@ -405,6 +365,11 @@ def main():
         "--always-all",
         action="store_true",
         help="Respond to all messages (unsafe: can trigger loops)",
+    )
+    parser.add_argument(
+        "--agent-handoffs",
+        action="store_true",
+        help="Allow agent-to-agent plaintext handoffs without @mentions",
     )
     parser.add_argument("--model", default="gemini-2.5-flash")
     parser.add_argument("--session-title", default=None)
@@ -420,7 +385,29 @@ def main():
         level=logging.INFO,
         format="[%(asctime)s] [gemini/%(levelname)s] %(message)s",
     )
-    _maybe_run_startup_status_cmd()
+
+    status_cmd = os.environ.get("POLYCULE_GEMINI_STATUS_CMD", "").strip()
+    if status_cmd:
+        logger.info("Performing initial Gemini status hook...")
+        try:
+            status_result = subprocess.run(
+                shlex.split(status_cmd),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if status_result.returncode == 0:
+                logger.info("Gemini status hook:\n%s", status_result.stdout.strip())
+            else:
+                logger.warning(
+                    "Gemini status hook failed with exit code %s:\n%s",
+                    status_result.returncode,
+                    status_result.stderr.strip(),
+                )
+        except subprocess.TimeoutExpired:
+            logger.warning("Gemini status hook timed out.")
+        except Exception as e:
+            logger.warning("Error during Gemini status hook: %s", e)
 
     adapter = GeminiAdapter(
         name=args.name,
@@ -429,6 +416,7 @@ def main():
         hub_port=args.port,
         always_respond=args.always,
         always_all=args.always_all,
+        agent_handoffs=args.agent_handoffs,
         model=args.model,
         session_title=args.session_title,
         resume_session=args.resume,

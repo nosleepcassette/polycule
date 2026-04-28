@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Managed backend agent discovery for public Polycule installs.
 
@@ -9,13 +9,22 @@ fixed local profile roster. This module discovers Hermes profiles under
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import re
 import shutil
 from pathlib import Path
 
-HERMES_HOME = Path.home() / ".hermes"
+from config_loader import (
+    DEFAULT_EXTERNAL_AGENTS,
+    DEFAULT_HERMES_PROFILES,
+    load_config,
+)
+
+_PROJECT_DIR = Path(__file__).resolve().parents[1]
+_CONFIG = load_config(_PROJECT_DIR)
+
+HERMES_HOME = Path(_CONFIG.hermes.home).expanduser() if _CONFIG.hermes.home else Path.home() / ".hermes"
 HERMES_BIN = HERMES_HOME / "bin" / "hermes"
 _SUPPORTED_EXTERNAL_AGENTS = ("codex", "claude", "opencode", "gemini")
 
@@ -95,11 +104,13 @@ def external_agent_available(agent_name: str) -> tuple[bool, str]:
 
 def discover_hermes_profiles() -> list[str]:
     explicit = [_normalize_profile_selector(item) for item in _csv_env("POLYCULE_HERMES_PROFILES")]
+    if not explicit and _CONFIG.hermes.profiles:
+        explicit = [_normalize_profile_selector(item) for item in _CONFIG.hermes.profiles]
     if explicit:
         profiles = explicit
     else:
         profiles: list[str] = []
-        if HERMES_HOME.exists():
+        if HERMES_HOME.exists() or "hermes" in _CONFIG.agents:
             profiles.append("default")
         profile_root = HERMES_HOME / "profiles"
         if profile_root.exists():
@@ -133,6 +144,11 @@ def _hermes_default_mode(profile: str) -> str:
         _normalize_profile_selector(item)
         for item in _csv_env("POLYCULE_HERMES_ALWAYS_PROFILES")
     }
+    if not always:
+        always = {
+            _normalize_profile_selector(item)
+            for item in _CONFIG.hermes.always_profiles
+        }
     mention = {
         _normalize_profile_selector(item)
         for item in _csv_env("POLYCULE_HERMES_MENTION_PROFILES")
@@ -142,14 +158,14 @@ def _hermes_default_mode(profile: str) -> str:
         return "always"
     if normalized in mention:
         return "mention"
-    if normalized in {"default", "cassette", "wizard"}:
+    if normalized == "default":
         return "always"
     return "mention"
 
 
 def _hermes_hint(profile: str, agent_name: str) -> tuple[str, tuple[tuple[str, int], ...]]:
     lowered = f"{profile} {agent_name}".lower()
-    if any(token in lowered for token in ("wizard", "plan", "planner", "research", "docs", "writer")):
+    if any(token in lowered for token in ("plan", "planner", "research", "docs", "writer")):
         return (
             f"Hermes profile '{profile}' for planning, docs, and synthesis",
             (
@@ -198,6 +214,8 @@ def _hermes_hint(profile: str, agent_name: str) -> tuple[str, tuple[tuple[str, i
 def _fixed_external_agents() -> list[ManagedAgent]:
     supported = set(_SUPPORTED_EXTERNAL_AGENTS)
     explicit = {_slug(item) for item in _csv_env("POLYCULE_EXTERNAL_AGENTS")}
+    if not explicit and _CONFIG.external.agents:
+        explicit = {_slug(item) for item in _CONFIG.external.agents}
     if explicit:
         supported &= explicit
 
@@ -206,7 +224,8 @@ def _fixed_external_agents() -> list[ManagedAgent]:
         if name not in supported:
             continue
         available, _detail = external_agent_available(name)
-        if not available and not _env_truthy("POLYCULE_INCLUDE_UNAVAILABLE_EXTERNALS"):
+        configured = name in _CONFIG.agents or name in DEFAULT_EXTERNAL_AGENTS
+        if not available and not configured and not _env_truthy("POLYCULE_INCLUDE_UNAVAILABLE_EXTERNALS"):
             continue
         if name == "codex":
             agents.append(
@@ -298,7 +317,10 @@ def _fixed_external_agents() -> list[ManagedAgent]:
 def get_managed_agents() -> list[ManagedAgent]:
     agents: list[ManagedAgent] = []
     hermes_ok, _detail = hermes_available()
-    if hermes_ok or _env_truthy("POLYCULE_INCLUDE_UNAVAILABLE_HERMES"):
+    configured_hermes = any(
+        name not in _SUPPORTED_EXTERNAL_AGENTS for name in _CONFIG.agents
+    )
+    if hermes_ok or configured_hermes or _env_truthy("POLYCULE_INCLUDE_UNAVAILABLE_HERMES"):
         profiles = discover_hermes_profiles()
         used_names: set[str] = set()
         for profile in profiles:
@@ -330,7 +352,44 @@ def get_managed_agents() -> list[ManagedAgent]:
             )
 
     agents.extend(_fixed_external_agents())
-    return agents
+
+    known = {agent.name for agent in agents}
+    for name, cfg in _CONFIG.agents.items():
+        if name in known or name in _SUPPORTED_EXTERNAL_AGENTS:
+            continue
+        summary, keywords = _hermes_hint(name, name)
+        agents.append(
+            ManagedAgent(
+                name=name,
+                display_name=cfg.alias or _display_name(name),
+                adapter="hermes",
+                profile="default" if name == "hermes" else name,
+                default_mode=cfg.mode,
+                billing="local",
+                summary=summary,
+                keywords=keywords,
+            )
+        )
+
+    configured_order = {name: index for index, name in enumerate(_CONFIG.agent_names)}
+    configured_agents: list[ManagedAgent] = []
+    for agent in agents:
+        cfg = _CONFIG.agents.get(agent.name)
+        if cfg:
+            agent = replace(
+                agent,
+                display_name=cfg.alias or agent.display_name,
+                default_mode=cfg.mode or agent.default_mode,
+            )
+        configured_agents.append(agent)
+
+    configured_agents.sort(
+        key=lambda agent: (
+            configured_order.get(agent.name, len(configured_order)),
+            agent.name,
+        )
+    )
+    return configured_agents
 
 
 def get_managed_agent_names() -> list[str]:

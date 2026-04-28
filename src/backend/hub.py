@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Polycule Hub — central TCP message broker for multi-agent collaboration.
 
@@ -11,6 +11,7 @@ Protocol: see BUILD.md
 """
 
 import asyncio
+import argparse
 import json
 import logging
 import os
@@ -464,6 +465,7 @@ class PolyculeServer:
         self.directives: Dict[str, dict] = {}
         self.running = False
         self._server: Optional[asyncio.AbstractServer] = None
+        self._shutdown_task: Optional[asyncio.Task] = None
 
     # -----------------------------------------------------------------------
     # Start / stop
@@ -496,7 +498,8 @@ class PolyculeServer:
                 self.db.save_room(room.id, room.name)
 
         self._server = await asyncio.start_server(
-            self.handle_client, self.host, self.port
+            self.handle_client, self.host, self.port,
+            limit=2**22  # 4MB line limit — context dumps can be large
         )
         addr = self._server.sockets[0].getsockname()
         logger.info(f"Polycule Hub listening on {addr}")
@@ -515,6 +518,27 @@ class PolyculeServer:
             for room_id in list(self.router.rooms.keys()):
                 self.router.remove_room(room_id)
         logger.info("Polycule Hub stopped")
+
+    def status_payload(self) -> dict:
+        rooms = self.router.get_rooms()
+        agents = [
+            {"id": agent.id, "name": agent.name, "type": agent.type}
+            for agent in self.router.agents.values()
+        ]
+        return {
+            "host": self.host,
+            "port": self.port,
+            "room_count": len(rooms),
+            "agent_count": len(agents),
+            "rooms": rooms,
+            "agents": agents,
+        }
+
+    async def _shutdown_after_notice(self, mode: str, timeout: float):
+        delay = 0.0 if mode == "immediate" else max(0.0, timeout)
+        if delay:
+            await asyncio.sleep(delay)
+        await self.stop()
 
     def _restore_rooms_from_db(self):
         """Recreate rooms from DB on startup so history is accessible."""
@@ -556,7 +580,7 @@ class PolyculeServer:
                 name=handshake.get("name", "Anonymous"),
                 type=handshake.get("agent_type", "unknown"),
                 handle=writer,
-                is_operator=(handshake.get("agent_type") == "human"),
+                is_operator=handshake.get("agent_type") == "human",
             )
             logger.info(f"Agent connected: {agent.name} ({agent.type})")
 
@@ -811,7 +835,7 @@ class PolyculeServer:
             await agent.handle.drain()
             return current_room_id
 
-        # --- Settings / room-control commands ---
+        # --- Settings ---
 
         elif command == "set_auto_approve":
             value = bool(message.get("value", False))
@@ -914,6 +938,14 @@ class PolyculeServer:
                 current_room_id,
             )
 
+        elif command == "cancel_response":
+            return await self._handle_cancel_response(
+                agent,
+                message,
+                room_id,
+                current_room_id,
+            )
+
         elif command == "send_directive":
             return await self._handle_directive(
                 agent,
@@ -929,6 +961,89 @@ class PolyculeServer:
                 room_id,
                 current_room_id,
             )
+
+        elif command == "agent_mode_update":
+            # Broadcast a live mode change to all agents in the room so they
+            # update their trigger policy without needing a process restart.
+            target_agent = str(message.get("agent", "")).strip().lower()
+            new_mode = str(message.get("mode", "")).strip().lower()
+            if target_agent and new_mode and room_id and room_id in self.router.rooms:
+                self.router._broadcast_to_room(
+                    room_id,
+                    {
+                        "type": "system",
+                        "action": "agent_mode_changed",
+                        "agent": target_agent,
+                        "mode": new_mode,
+                        "changed_by": agent.name,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                )
+            return current_room_id
+
+        elif command == "status":
+            self._write(
+                agent.handle,
+                {
+                    "type": "command_response",
+                    "command": "status",
+                    "status": self.status_payload(),
+                    "timestamp": datetime.now().isoformat(),
+                },
+            )
+            await agent.handle.drain()
+            return current_room_id
+
+        elif command == "shutdown":
+            mode = str(message.get("mode", "graceful")).strip().lower()
+            if mode not in ("graceful", "immediate"):
+                mode = "graceful"
+            timeout = self._env_float("POLYCULE_HUB_SHUTDOWN_TIMEOUT", 2.0)
+            for room_id in list(self.router.rooms):
+                self.router._broadcast_to_room(
+                    room_id,
+                    {
+                        "type": "system",
+                        "action": "shutdown_announced",
+                        "mode": mode,
+                        "issued_by": agent.name,
+                        "timeout": timeout,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                )
+            self._write(
+                agent.handle,
+                {
+                    "type": "command_response",
+                    "command": "shutdown",
+                    "mode": mode,
+                    "ok": True,
+                },
+            )
+            await agent.handle.drain()
+            if not self._shutdown_task or self._shutdown_task.done():
+                self._shutdown_task = asyncio.create_task(
+                    self._shutdown_after_notice(mode, timeout)
+                )
+            return current_room_id
+
+        elif command == "set_topic":
+            # Persist room topic and broadcast to all members.
+            topic = str(message.get("topic", "")).strip()
+            if room_id and self.db:
+                self.db.set_room_topic(room_id, topic)
+            if room_id:
+                self.router._broadcast_to_room(
+                    room_id,
+                    {
+                        "type": "system",
+                        "action": "topic_changed",
+                        "topic": topic,
+                        "changed_by": agent.name,
+                        "timestamp": datetime.now().isoformat(),
+                    },
+                )
+            return current_room_id
 
         # --- Structural (tmux) commands — require approval unless auto_approve ---
 
@@ -1129,6 +1244,36 @@ class PolyculeServer:
                 "room_id": room_id,
                 "targets": targets,
                 "auto_disabled": auto_disabled,
+                "issued_by": agent.name,
+                "timestamp": datetime.now().isoformat(),
+            },
+        )
+        return current_room_id
+
+    async def _handle_cancel_response(
+        self,
+        agent: Agent,
+        message: dict,
+        room_id: Optional[str],
+        current_room_id: Optional[str],
+    ) -> Optional[str]:
+        if not room_id or room_id not in self.router.rooms:
+            return current_room_id
+        targets = self._normalize_targets(message.get("targets", []))
+        if not targets:
+            self._write(
+                agent.handle,
+                {"type": "error", "message": "cancel targets missing"},
+            )
+            await agent.handle.drain()
+            return current_room_id
+        self.router._broadcast_to_room(
+            room_id,
+            {
+                "type": "system",
+                "action": "cancel_response",
+                "room_id": room_id,
+                "targets": targets,
                 "issued_by": agent.name,
                 "timestamp": datetime.now().isoformat(),
             },
@@ -1433,7 +1578,12 @@ class PolyculeServer:
 
 
 async def main():
-    server = PolyculeServer(host="localhost", port=7777)
+    parser = argparse.ArgumentParser(description="Polycule Hub")
+    parser.add_argument("--host", default=os.getenv("POLYCULE_HUB_HOST", "localhost"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("POLYCULE_HUB_PORT", "7777")))
+    args = parser.parse_args()
+
+    server = PolyculeServer(host=args.host, port=args.port)
     try:
         await server.start()
     except KeyboardInterrupt:

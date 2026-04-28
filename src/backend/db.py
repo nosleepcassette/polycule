@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 PolyculeDB — SQLite persistence for rooms, messages, and settings.
 
@@ -41,6 +41,19 @@ CREATE TABLE IF NOT EXISTS settings (
     value       TEXT NOT NULL,
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS pins (
+    id          TEXT PRIMARY KEY,
+    room_id     TEXT NOT NULL,
+    message_id  TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    sender_name TEXT NOT NULL,
+    pinned_by   TEXT NOT NULL,
+    pinned_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pins_room
+    ON pins (room_id, pinned_at);
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_approve', 'false');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('context_window', '100');
@@ -164,6 +177,58 @@ class PolyculeDB:
             return int(self.get_setting('context_window', '100'))
         except ValueError:
             return 100
+
+    # ------------------------------------------------------------------
+    # Pins
+    # ------------------------------------------------------------------
+
+    def save_pin(
+        self,
+        room_id: str,
+        message_id: str,
+        content: str,
+        sender_name: str,
+        pinned_by: str,
+    ):
+        pin_id = f"{room_id}:{message_id}"
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO pins
+                   (id, room_id, message_id, content, sender_name, pinned_by)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (pin_id, room_id, message_id, content, sender_name, pinned_by),
+            )
+
+    def get_pins(self, room_id: str) -> List[dict]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT message_id, content, sender_name, pinned_by, pinned_at
+                   FROM pins WHERE room_id = ?
+                   ORDER BY pinned_at ASC""",
+                (room_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_pin(self, room_id: str, message_id: str):
+        pin_id = f"{room_id}:{message_id}"
+        with self._conn() as conn:
+            conn.execute("DELETE FROM pins WHERE id = ?", (pin_id,))
+
+    # ------------------------------------------------------------------
+    # Convenience settings
+    # ------------------------------------------------------------------
+
+    def get_last_room(self, default: str = "Default") -> str:
+        return self.get_setting("last_room", default) or default
+
+    def set_last_room(self, room_name: str):
+        self.set_setting("last_room", room_name)
+
+    def get_room_topic(self, room_id: str, default: str = "") -> str:
+        return self.get_setting(f"topic:{room_id}", default) or default
+
+    def set_room_topic(self, room_id: str, topic: str):
+        self.set_setting(f"topic:{room_id}", topic)
 
 
 def _row_to_message(row: dict) -> dict:

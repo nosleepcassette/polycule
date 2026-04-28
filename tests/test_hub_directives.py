@@ -150,6 +150,64 @@ class HubDirectiveTests(unittest.IsolatedAsyncioTestCase):
         maps_writer.close()
         await maps_writer.wait_closed()
 
+    async def test_cancel_response_broadcasts_system_event(self):
+        maps_reader, maps_writer = await self._connect("maps", "human")
+        codex_reader, codex_writer = await self._connect("codex", "codex")
+
+        maps_writer.write(
+            (
+                json.dumps(
+                    {
+                        "type": "command",
+                        "command": "cancel_response",
+                        "room_id": "default-room",
+                        "targets": ["codex"],
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await maps_writer.drain()
+
+        cancel_event = await _read_until(
+            codex_reader,
+            lambda p: p.get("type") == "system" and p.get("action") == "cancel_response",
+        )
+        self.assertEqual(["codex"], cancel_event["targets"])
+        self.assertEqual("maps", cancel_event["issued_by"])
+
+        maps_writer.close()
+        codex_writer.close()
+        await maps_writer.wait_closed()
+        await codex_writer.wait_closed()
+
+    async def test_status_command_returns_structured_payload(self):
+        maps_reader, maps_writer = await self._connect("maps", "human")
+
+        maps_writer.write(
+            (
+                json.dumps(
+                    {
+                        "type": "command",
+                        "command": "status",
+                        "room_id": "default-room",
+                    }
+                )
+                + "\n"
+            ).encode()
+        )
+        await maps_writer.drain()
+
+        response = await _read_until(
+            maps_reader,
+            lambda p: p.get("type") == "command_response" and p.get("command") == "status",
+        )
+        self.assertEqual(1, response["status"]["room_count"])
+        self.assertGreaterEqual(response["status"]["agent_count"], 1)
+
+        maps_writer.close()
+        await maps_writer.wait_closed()
+
 
 if __name__ == "__main__":
     unittest.main()

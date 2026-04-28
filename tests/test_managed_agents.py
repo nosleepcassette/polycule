@@ -48,10 +48,12 @@ class ManagedAgentDiscoveryTests(unittest.TestCase):
         ):
             agents = managed_agents.get_managed_agents()
 
-        self.assertEqual(["hermes", "analyst"], [agent.name for agent in agents])
+        names = [agent.name for agent in agents]
+        self.assertEqual(["hermes", "codex", "claude", "opencode", "gemini"], names[:5])
+        self.assertIn("analyst", names)
         self.assertEqual("default", agents[0].profile)
         self.assertEqual("always", agents[0].default_mode)
-        self.assertEqual("mention", agents[1].default_mode)
+        self.assertEqual("mention", next(agent.default_mode for agent in agents if agent.name == "analyst"))
 
     def test_default_hermes_sessions_live_under_root_home(self):
         with tempfile.TemporaryDirectory() as tmpdir:

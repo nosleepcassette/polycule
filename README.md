@@ -25,9 +25,13 @@ The public release is machine-adaptive:
 
 - Python 3.11+
 - `tmux`
-- `urwid`: `python3 -m pip install urwid`
+- `uv` is recommended for managed installs, or install `urwid` manually
 - `fzf` is optional but improves tmux session selection
 - At least one agent CLI you want to run
+
+Polycule does not install agent CLIs for you. It discovers tools already
+available on your machine and keeps missing or disabled backends visible as
+inactive panes instead of failing the whole workspace.
 
 Supported backends:
 
@@ -42,13 +46,18 @@ Supported backends:
 ```bash
 git clone https://github.com/nosleepcassette/polycule ~/dev/polycule
 cd ~/dev/polycule
-python3 -m pip install urwid
+uv sync
 export PATH="$HOME/dev/polycule/bin:$PATH"
 ```
 
 Add that `PATH` line to your shell profile if you want `polycule` available in new terminals.
+You can also run commands with `uv run polycule ...`.
 
 ## First Run
+
+On first start, Polycule writes a local configuration if none exists. The config
+can live at `polycule.toml` in the project root or at
+`~/.config/polycule/config.toml`.
 
 Inspect the backend roster Polycule discovered on your machine:
 
@@ -62,13 +71,19 @@ Then start the workspace:
 polycule start --name "$USER" --room Main
 ```
 
+For a quick readiness check without attaching to tmux, run:
+
+```bash
+polycule status --json
+```
+
 That command will:
 
-- reuse the current tmux session if you are already inside one, or create a fresh Polycule session
+- create or reuse the `polycule` tmux session, prompting before replacing an existing one
 - reconcile the default layout
 - start the hub
 - start the chat TUI
-- start every discovered and enabled backend agent
+- start every configured backend pane, with disabled/missing agents showing an inline notice
 
 If you do not want Polycule to attach immediately:
 
@@ -86,13 +101,13 @@ Polycule discovers Hermes agents from `~/.hermes` like this:
 On a machine with:
 
 - `~/.hermes`
-- `~/.hermes/profiles/wizard`
+- `~/.hermes/profiles/planner`
 - `~/.hermes/profiles/analyst`
 
 the discovered Hermes agents will be:
 
 - `@hermes`
-- `@wizard`
+- `@planner`
 - `@analyst`
 
 Installed external CLIs are added alongside those Hermes agents when available.
@@ -100,24 +115,30 @@ Installed external CLIs are added alongside those Hermes agents when available.
 Default response modes:
 
 - the default Hermes profile starts in `always`
-- `cassette` and `wizard` profiles also start in `always`
-- other discovered Hermes profiles start in `mention`
-- `codex` starts in `always`
+- discovered Hermes profiles start in `mention` unless configured otherwise
+- external CLIs are listed but disabled until enabled in config or at runtime
 - `claude`, `opencode`, and `gemini` start in `mention`
 
-You can change any of that at runtime with `polycule agent mode <agent> <mention|always|off>`.
+You can change any of that at runtime with `polycule agent mode <agent> <mention|always|handoff|ffa|off>`.
 
 ## Overrides
 
-You do not need a config file for a normal install. If you want to shape discovery, use environment variables:
+Configuration priority is:
 
-- `POLYCULE_HERMES_PROFILES=default,wizard,analyst`
+1. `polycule.toml` in the project root
+2. `~/.config/polycule/config.toml`
+3. environment variables
+4. CLI flags
+
+See `polycule.toml.example` for the full schema. Environment variables still work:
+
+- `POLYCULE_HERMES_PROFILES=default,planner,analyst`
   Restrict Hermes discovery to an explicit list.
-- `POLYCULE_HERMES_EXCLUDE_PROFILES=cassette`
+- `POLYCULE_HERMES_EXCLUDE_PROFILES=old-profile`
   Exclude specific Hermes profiles.
 - `POLYCULE_HERMES_DEFAULT_NAME=guide`
   Rename the default Hermes profile from `hermes` to another public-facing agent name.
-- `POLYCULE_HERMES_ALWAYS_PROFILES=wizard,analyst`
+- `POLYCULE_HERMES_ALWAYS_PROFILES=analyst`
   Force specific Hermes profiles into `always` mode on first discovery.
 - `POLYCULE_HERMES_MENTION_PROFILES=default`
   Force specific Hermes profiles into `mention` mode on first discovery.
@@ -131,7 +152,11 @@ Optional adapter-specific overrides:
 - `POLYCULE_CLAUDE_BYPASS_PERMISSIONS=1`
 - `POLYCULE_CLAUDE_ALLOWED_TOOLS="Bash,Read,Write,Edit"`
 - `POLYCULE_CLAUDE_PERMISSION_MODE="bypassPermissions"`
-- `POLYCULE_GEMINI_STATUS_CMD="python3 ~/.hermes/scripts/worklog.py status"`
+- `POLYCULE_GEMINI_STATUS_CMD="python3 ~/scripts/agent-status.py"`
+
+Permission-bypass flags are off by default in the public repo. Only set the
+adapter-specific override variables when you intentionally want those CLI
+tools to run with broader local permissions.
 
 ## Layout
 
@@ -141,7 +166,8 @@ Default tmux windows:
 - `swarm`: one spare worker pane
 - `backend`: `hub-log | <one pane per discovered backend agent>`
 
-If you run `polycule start --new` repeatedly, Polycule creates fresh sessions like `polycule`, `polycule-2`, `polycule-3`, and so on.
+If a `polycule` tmux session already exists, `polycule start` prompts to attach,
+restart, or quit. Use `--attach`, `--restart`, or `--fresh` to skip the prompt.
 
 ## Using It
 
@@ -161,7 +187,7 @@ Useful slash commands:
 - `/help`
 - `/agents`
 - `/modes`
-- `/mode <agent> <mention|always|off>`
+- `/mode <agent> <mention|always|handoff|ffa|off>`
 - `/enable <agent>`
 - `/disable <agent>`
 - `/summon <all|agent...>`
@@ -170,13 +196,20 @@ Useful slash commands:
 - `/watch <agent|all> <off|human|room|@agent>`
 - `/rollcall`
 - `/theme amber`
+- `/pin <message_id|prefix|last>`
+- `/unpin <message_id|prefix>`
+- `/which <task>`
 - `/restart`
 - `/restart --full`
+- `/quit`
 
 Keyboard shortcuts:
 
 - `Tab` / `Shift-Tab`: slash completion
+- `Tab` / `Shift-Tab`: filesystem completion for `~/...` and `/...` paths
 - `Up` / `Down`: input history
+- `Ctrl-U`: clear the current input line
+- `Ctrl-C`: clear the input line, or show a `/quit` hint if empty
 - `Ctrl-L`: clear the chat view
 
 ## CLI Reference
@@ -184,16 +217,22 @@ Keyboard shortcuts:
 ```bash
 polycule start
 polycule start --background
-polycule start --new
+polycule start --attach
+polycule start --restart
+polycule start --fresh
 polycule hub
 polycule tui --name "$USER"
 polycule status
+polycule status --json
+polycule kill
+polycule kill --hub-only
+polycule kill --panes-only
 polycule agent status
 polycule agent modes
 polycule agent enable <agent>
 polycule agent disable <agent>
-polycule agent mode <agent> <mention|always|off>
-polycule agent hermes --profile analyst --room Main
+polycule agent mode <agent> <mention|always|handoff|ffa|off>
+polycule agent hermes --room Main
 polycule agent <discovered-hermes-agent> --room Main
 polycule agent codex --room Main
 polycule agent claude --room Main

@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Polycule Chat TUI — IRC-style terminal chat interface.
 
@@ -35,50 +35,73 @@ from runtime_state import (
     get_temporary_agent_enablements,
     mark_temporary_agent_enablements,
 )
-from managed_agents import (
-    get_agent_capability_hints,
-    get_default_backend_agent_modes,
-    get_free_agent_names,
-    get_managed_agent_names,
-    get_paid_agent_names,
-)
+from config_loader import load_config
 
 logger = logging.getLogger(__name__)
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 POLYCULE_BIN = PROJECT_DIR / "bin" / "polycule"
 DB_PATH = PROJECT_DIR / "polycule.db"
+CONFIG = load_config(PROJECT_DIR)
+
+# Operator name: env var > $USER > fallback "you"
 DEFAULT_HUMAN_NAME = (
     os.environ.get("POLYCULE_OPERATOR_NAME")
+    or CONFIG.operator.name
     or os.environ.get("USER")
     or os.environ.get("LOGNAME")
     or "you"
 )
-AGENT_MODES = ("mention", "always", "off")
+
+# Dynamic agent discovery via managed_agents.py.
+# Falls back to hardcoded defaults if not available (e.g. during tests).
+try:
+    from managed_agents import (
+        get_agent_capability_hints,
+        get_default_backend_agent_modes,
+        get_free_agent_names,
+        get_managed_agent_names,
+        get_paid_agent_names,
+    )
+    BACKEND_AGENTS = tuple(get_managed_agent_names())
+    BACKEND_AGENT_SET = set(BACKEND_AGENTS)
+    DEFAULT_BACKEND_AGENT_MODES = get_default_backend_agent_modes()
+    FREE_AGENTS = frozenset(get_free_agent_names())
+    PAID_AGENTS = frozenset(get_paid_agent_names())
+    AGENT_CAPABILITY_HINTS = get_agent_capability_hints()
+except Exception:
+    BACKEND_AGENTS = ("hermes", "codex", "claude", "opencode", "gemini")
+    BACKEND_AGENT_SET = set(BACKEND_AGENTS)
+    DEFAULT_BACKEND_AGENT_MODES = {
+        "hermes": "always",
+        "codex": "mention",
+        "claude": "mention",
+        "opencode": "mention",
+        "gemini": "mention",
+    }
+    FREE_AGENTS = frozenset(("hermes", "opencode"))
+    PAID_AGENTS = frozenset(("codex", "claude", "gemini"))
+    AGENT_CAPABILITY_HINTS = {}
+
+AGENT_MODES = ("mention", "always", "handoff", "ffa", "off")
+AGENT_MODE_ALIASES = {
+    "free": "ffa",
+    "freeforall": "ffa",
+    "free-for-all": "ffa",
+    "swarm": "ffa",
+    "collab": "handoff",
+    "relay": "handoff",
+}
 
 FREE_MODE_COMMANDS = frozenset(("free", "free-mode"))
 
-def _backend_agents() -> tuple[str, ...]:
-    return tuple(get_managed_agent_names())
-
-
-def _backend_agent_set() -> set[str]:
-    return set(_backend_agents())
-
-
 def DEFAULT_AGENT_MODE(agent_name: str) -> str:
-    return get_default_backend_agent_modes().get(agent_name.strip().lower(), "mention")
+    return DEFAULT_BACKEND_AGENT_MODES.get(agent_name.strip().lower(), "mention")
 
 
-def _free_agents() -> frozenset[str]:
-    return frozenset(get_free_agent_names())
-
-
-def _paid_agents() -> frozenset[str]:
-    return frozenset(get_paid_agent_names())
-
-
-def _agent_capability_hints() -> dict[str, dict[str, object]]:
-    return get_agent_capability_hints()
+def NORMALIZE_AGENT_MODE(mode_name: str, default: str = "mention") -> str:
+    normalized = (mode_name or "").strip().lower()
+    normalized = AGENT_MODE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in AGENT_MODES else default
 
 SLASH_COMMANDS = (
     "help",
@@ -89,6 +112,7 @@ SLASH_COMMANDS = (
     "deny",
     "autoapprove",
     "aa",
+    "room",
     "rooms",
     "join",
     "disable",
@@ -102,11 +126,17 @@ SLASH_COMMANDS = (
     "topic",
     "search",
     "pin",
+    "unpin",
     "pins",
+    "rename",
     "summon",
     "brief",
     "watch",
     "standdown",
+    "cancel",
+    "detrigger",
+    "stop",
+    "which",
     "agents",
     "agentstatus",
     "rollcall",
@@ -123,25 +153,30 @@ SLASH_HELP = [
     ("/approve <id>", "approve a structural request"),
     ("/deny <id>", "deny a structural request"),
     ("/autoapprove [on|off]", "toggle auto-approve mode"),
-    ("/rooms", "list rooms"),
-    ("/join <room_id>", "join an existing room"),
+    ("/room [name]", "show current room, or join/create room by name"),
+    ("/rooms", "list all rooms"),
+    ("/join <room_id>", "join an existing room by ID"),
     ("/disable <agent>", "cooldown backend agent"),
     ("/enable <agent>", "reactivate backend agent"),
-    ("/mode <agent> <mention|always|off>", "set backend agent response mode"),
+    ("/mode <agent|all> <mention|always|handoff|ffa|off>", "set backend agent response mode"),
     ("/modes", "show backend agent response modes"),
-    ("/free", "toggle local/non-premium mode"),
+    ("/free", "toggle free mode (free agents only)"),
     ("/free-mode", "alias for /free"),
-    ("/which <task>", "query agents for best fit"),
+    ("/which <task>", "query agents for best fit  [free]/[paid] tagged"),
     ("/theme <name>", "set color theme"),
     ("/themes", "list available themes"),
     ("/topic [text]", "set or show room topic"),
-    ("/search <query>", "search messages"),
-    ("/pin <id>", "pin message by ID"),
+    ("/search <query>", "search messages and show matching message IDs"),
+    ("/pin <message_id|prefix|last>", "pin a message by ID, unique prefix, or 'last'"),
+    ("/unpin <message_id|prefix>", "unpin a previously pinned message"),
     ("/pins", "list pinned messages"),
+    ("/rename me <name>", "change your operator display name"),
+    ("/rename <agent> <name>", "set display alias for an agent"),
     ("/summon <all|agent...>", "temporarily enable and call agents into the room"),
     ("/brief <all|agent...> -- <message>", "send a targeted room directive"),
     ("/watch <agent|all> <off|human|room|@agent>", "set phase-1 watch policy"),
     ("/standdown <all|agent...>", "revert temporary summon activations"),
+    ("/cancel <agent|all>", "stop an in-flight agent response"),
     ("/agents", "show backend agent state"),
     ("/rollcall", "mention all backend agents in one ping"),
     ("/clear", "clear the chat log (also ctrl+l)"),
@@ -156,6 +191,7 @@ SLASH_NOARG_COMMANDS = frozenset(
         "ahelp",
         "h",
         "?",
+        "room",
         "rooms",
         "modes",
         "free",
@@ -178,12 +214,13 @@ _MD_INLINE_RE = re.compile(r"(\*\*[^*\n]+?\*\*|\*[^*\n]+?\*|`[^`\n]+`|@\w+)")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 _BULLET_RE = re.compile(r"^([-*+]|\d+\.)\s+(.*)")
 _RULE_RE = re.compile(r"^[-*_]{3,}\s*$")
+_PATH_RE = re.compile(r"(^|(?<=\s))(~?/\S*)$")
 
 # ---------------------------------------------------------------------------
 # Palette and color mapping
 # ---------------------------------------------------------------------------
 
-DEFAULT_THEME_NAME = "amber"
+DEFAULT_THEME_NAME = CONFIG.theme.name or "amber"
 THEME_ALIASES = {
     "phosphor": "amber",
     "amber-phosphor": "amber",
@@ -204,10 +241,7 @@ _BASE_THEME = {
     "time": ("dark gray", ""),
     "bracket": ("dark gray", ""),
     "human": ("light cyan", ""),
-    "maps": ("light cyan", ""),
     "hermes": ("light magenta", ""),
-    "wizard": ("light magenta", ""),
-    "cassette": ("light magenta", ""),
     "claude": ("light blue", ""),
     "opencode": ("light blue", ""),
     "gemini": ("light cyan", ""),
@@ -245,10 +279,7 @@ THEMES = {
         time=("brown", ""),
         bracket=("brown", ""),
         human=("white", ""),
-        maps=("white", ""),
         hermes=("yellow", ""),
-        wizard=("yellow", ""),
-        cassette=("yellow", ""),
         claude=("light cyan", ""),
         opencode=("light cyan", ""),
         gemini=("white", ""),
@@ -271,10 +302,7 @@ THEMES = {
         time=("dark green", ""),
         bracket=("dark green", ""),
         human=("white", ""),
-        maps=("white", ""),
         hermes=("light green", ""),
-        wizard=("light green", ""),
-        cassette=("light green", ""),
         claude=("light cyan", ""),
         opencode=("light cyan", ""),
         gemini=("white", ""),
@@ -298,10 +326,7 @@ THEMES = {
         time=("dark gray", ""),
         bracket=("dark gray", ""),
         human=("white", ""),
-        maps=("white", ""),
         hermes=("light magenta", ""),
-        wizard=("light magenta", ""),
-        cassette=("light magenta", ""),
         claude=("light blue", ""),
         opencode=("light blue", ""),
         gemini=("yellow", ""),
@@ -340,11 +365,8 @@ def _agent_color(name: str, agent_type: str) -> str:
     t = agent_type.lower()
     for key in (n, t):
         if key in (
-            "maps",
             "human",
             "hermes",
-            "wizard",
-            "cassette",
             "claude",
             "opencode",
             "gemini",
@@ -456,11 +478,17 @@ class AgentHeader(urwid.WidgetWrap):
 
 class ChatMessage(urwid.WidgetWrap):
     def __init__(self, message: dict):
+        self.message = dict(message)
+        self.message_id = str(message.get("id", "")).strip()
         sender = message.get("sender", {})
-        name = sender.get("name", "?")
-        atype = sender.get("type", "unknown")
-        content = message.get("content", "")
-        ts = message.get("timestamp", "")
+        name = str(sender.get("name", "?"))
+        atype = str(sender.get("type", "unknown"))
+        content = str(message.get("content", ""))
+        ts = str(message.get("timestamp", ""))
+        self.sender_name = name
+        self.sender_type = atype
+        self.content = content
+        self.timestamp = ts
 
         try:
             t = datetime.fromisoformat(ts).strftime("%H:%M")
@@ -519,6 +547,8 @@ class ChatTUI:
         self.host = host
         self.port = port
         self._theme_name = self._load_theme_name()
+        self._max_file_completion_candidates = CONFIG.autocomplete.max_file_candidates
+        self._show_hidden_file_completions = CONFIG.autocomplete.show_hidden
 
         self.room_id: Optional[str] = None
         self.reader: Optional[asyncio.StreamReader] = None
@@ -531,8 +561,10 @@ class ChatTUI:
         self._free_mode = False  # free mode: only free (no-cost) agents respond
         self._connected_agents: dict[str, dict] = {}  # agent_id -> {name, type}
         self._topic = ""
-        self._pinned_messages: dict[int, dict] = {}
+        self._pinned_messages: dict[str, dict] = {}
         self._last_agent_state_snapshot: dict[str, dict[str, str]] = {}
+        self._message_log = deque(maxlen=5000)
+        self._messages_by_id: dict[str, dict] = {}
         self._seen_message_ids: set[str] = set()
         self._seen_message_order = deque(maxlen=5000)
         self._reconnect_base_delay = 1.0
@@ -541,6 +573,10 @@ class ChatTUI:
         self._completion_matches: list[str] = []
         self._completion_index = -1
         self._pending_request_ids: list[str] = []
+        # Agent display aliases: lowercased_name → display_name (set via /rename)
+        self._agent_display_aliases: dict[str, str] = {}
+        self._load_display_aliases()
+        self.name = self._agent_display_aliases.get("__operator__", self.name)
 
         # Bracketed paste state
         self._pasting = False
@@ -557,6 +593,8 @@ class ChatTUI:
         # Restart flags (checked after main loop exits)
         self._restart_requested = False
         self._full_restart_requested = False
+        self._hub_restart_requested = False
+        self._restart_now = False
 
         self._build_ui()
 
@@ -599,6 +637,111 @@ class ChatTUI:
                 )
         except sqlite3.Error as exc:
             logger.warning("Failed to persist chat theme %s: %s", theme_name, exc)
+
+    # ------------------------------------------------------------------
+    # DB helpers
+    # ------------------------------------------------------------------
+
+    def _db_get(self, key: str, default: str = "") -> str:
+        if not DB_PATH.exists():
+            return default
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?", (key,)
+                ).fetchone()
+            return str(row[0]) if row and row[0] is not None else default
+        except sqlite3.Error:
+            return default
+
+    def _db_set(self, key: str, value: str):
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS settings "
+                    "(key TEXT PRIMARY KEY, value TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+                )
+                conn.execute(
+                    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (key, value),
+                )
+        except sqlite3.Error as exc:
+            logger.warning("DB write failed key=%s: %s", key, exc)
+
+    def _db_load_pins(self, room_id: str) -> list[dict]:
+        if not DB_PATH.exists():
+            return []
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute(
+                    "SELECT message_id, content, sender_name, pinned_by, pinned_at "
+                    "FROM pins WHERE room_id = ? ORDER BY pinned_at ASC",
+                    (room_id,),
+                ).fetchall()
+            return [
+                {"id": r[0], "content": r[1], "sender_name": r[2],
+                 "pinned_by": r[3], "pinned_at": r[4]}
+                for r in rows
+            ]
+        except sqlite3.Error:
+            return []
+
+    def _db_save_pin(self, room_id: str, msg_id: str, content: str, sender_name: str):
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS pins "
+                    "(id TEXT PRIMARY KEY, room_id TEXT NOT NULL, message_id TEXT NOT NULL, "
+                    "content TEXT NOT NULL, sender_name TEXT NOT NULL, pinned_by TEXT NOT NULL, "
+                    "pinned_at TEXT NOT NULL DEFAULT (datetime('now')))"
+                )
+                pin_id = f"{room_id}:{msg_id}"
+                conn.execute(
+                    "INSERT OR REPLACE INTO pins "
+                    "(id, room_id, message_id, content, sender_name, pinned_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (pin_id, room_id, msg_id, content, sender_name, self.name),
+                )
+        except sqlite3.Error as exc:
+            logger.warning("DB save pin failed: %s", exc)
+
+    def _db_delete_pin(self, room_id: str, msg_id: str):
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "DELETE FROM pins WHERE id = ?", (f"{room_id}:{msg_id}",)
+                )
+        except sqlite3.Error as exc:
+            logger.warning("DB delete pin failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Display aliases (persisted via settings table, key: alias:<name>)
+    # ------------------------------------------------------------------
+
+    def _load_display_aliases(self):
+        if not DB_PATH.exists():
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'alias:%'"
+                ).fetchall()
+            for key, value in rows:
+                slug = key[6:]  # strip "alias:"
+                if slug and value:
+                    self._agent_display_aliases[slug] = value
+        except sqlite3.Error:
+            pass
+
+    def _save_display_alias(self, slug: str, display_name: str):
+        self._agent_display_aliases[slug] = display_name
+        self._db_set(f"alias:{slug}", display_name)
+
+    def _resolve_display_name(self, raw_name: str) -> str:
+        """Return alias for raw_name if set, else raw_name unchanged."""
+        return self._agent_display_aliases.get(raw_name.lower(), raw_name)
 
     def _apply_theme(self, theme_name: str, *, persist: bool = False) -> str:
         normalized = _normalize_theme_name(theme_name)
@@ -667,6 +810,15 @@ class ChatTUI:
             self._loop.draw_screen()
 
     def add_message(self, message: dict):
+        # Apply display aliases so /rename takes effect immediately in the log
+        sender = message.get("sender", {})
+        raw_name = sender.get("name", "?")
+        aliased = self._resolve_display_name(raw_name)
+        if aliased != raw_name:
+            message = dict(message)
+            message["sender"] = dict(sender)
+            message["sender"]["name"] = aliased
+
         msg_id = message.get("id")
         if msg_id:
             if msg_id in self._seen_message_ids:
@@ -676,6 +828,7 @@ class ChatTUI:
                 self._seen_message_ids.discard(oldest)
             self._seen_message_order.append(msg_id)
             self._seen_message_ids.add(msg_id)
+        self._remember_message_record(message)
         sender = message.get("sender", {})
         name = sender.get("name", "?")
         atype = sender.get("type", "unknown")
@@ -683,6 +836,89 @@ class ChatTUI:
             self._last_sender_name = name
             self._append(AgentHeader(name, _agent_color(name, atype)))
         self._append(ChatMessage(message))
+
+    def _remember_message_record(self, message: dict):
+        sender = message.get("sender", {})
+        record = {
+            "id": str(message.get("id", "")).strip(),
+            "content": str(message.get("content", "")),
+            "sender_name": str(sender.get("name", "?")),
+            "sender_type": str(sender.get("type", "unknown")),
+            "timestamp": str(message.get("timestamp", "")),
+        }
+        if len(self._message_log) == self._message_log.maxlen:
+            dropped = self._message_log.popleft()
+            dropped_id = str(dropped.get("id", "")).strip()
+            if dropped_id:
+                self._messages_by_id.pop(dropped_id, None)
+        self._message_log.append(record)
+        record_id = record["id"]
+        if record_id:
+            self._messages_by_id[record_id] = record
+
+    @staticmethod
+    def _message_snippet(content: str, limit: int = 72) -> str:
+        compact = " ".join(str(content or "").split())
+        if not compact:
+            return "(empty)"
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 1].rstrip() + "…"
+
+    def _format_message_reference(self, record: dict) -> str:
+        msg_id = str(record.get("id", "")).strip() or "unknown"
+        sender = str(record.get("sender_name", "?")).strip() or "?"
+        snippet = self._message_snippet(str(record.get("content", "")))
+        return f"[{msg_id}] {sender}: {snippet}"
+
+    def _resolve_message_reference(self, raw_ref: str) -> tuple[Optional[dict], Optional[str]]:
+        reference = str(raw_ref or "").strip()
+        if not reference:
+            return None, "usage: /pin <message_id|prefix|last>"
+
+        if reference.lower() in ("last", "latest"):
+            if not self._message_log:
+                return None, "no chat messages available to pin"
+            return self._message_log[-1], None
+
+        exact = self._messages_by_id.get(reference)
+        if exact:
+            return exact, None
+
+        prefix = reference.lower()
+        matches = [
+            record
+            for record in self._message_log
+            if str(record.get("id", "")).lower().startswith(prefix)
+        ]
+        if not matches:
+            return None, f"message not found: {reference}"
+        if len(matches) > 1:
+            ids = ", ".join(str(record.get("id", "")) for record in matches[:3])
+            suffix = "…" if len(matches) > 3 else ""
+            return None, f"ambiguous message id prefix: {reference} ({ids}{suffix})"
+        return matches[0], None
+
+    def _resolve_pin_reference(self, raw_ref: str) -> tuple[Optional[dict], Optional[str]]:
+        reference = str(raw_ref or "").strip()
+        if not reference:
+            return None, "usage: /unpin <message_id|prefix>"
+        exact = self._pinned_messages.get(reference)
+        if exact:
+            return exact, None
+        prefix = reference.lower()
+        matches = [
+            record
+            for msg_id, record in self._pinned_messages.items()
+            if str(msg_id).lower().startswith(prefix)
+        ]
+        if not matches:
+            return None, f"pinned message not found: {reference}"
+        if len(matches) > 1:
+            ids = ", ".join(str(record.get("id", "")) for record in matches[:3])
+            suffix = "..." if len(matches) > 3 else ""
+            return None, f"ambiguous pinned message prefix: {reference} ({ids}{suffix})"
+        return matches[0], None
 
     def add_system(self, text: str, style: str = "system_fg"):
         self._append(SystemMessage(text, style))
@@ -715,6 +951,7 @@ class ChatTUI:
                 ("header", f"room: {self.room}"),
                 " ",
                 ("header", f"[{self.name}]"),
+                ("header", f" · topic: {self._topic}") if self._topic else "",
                 f"  {connected_marker}"
                 + free_marker
                 + agent_dots
@@ -762,7 +999,8 @@ class ChatTUI:
         try:
             await self._close_writer()
             self.reader, self.writer = await asyncio.open_connection(
-                self.host, self.port
+                self.host, self.port,
+                limit=2**22  # 4MB line limit — context dumps can be large
             )
 
             handshake = {
@@ -794,10 +1032,10 @@ class ChatTUI:
                 self.room = room_data.get("room_name", self.room)
                 self.connected = True
 
-                # Load history from room_state
-                for msg in room_data.get("recent_messages", []):
-                    if isinstance(msg, dict) and msg.get("type") == "message":
-                        self.add_message(msg)
+                # Do NOT pre-render room_state recent_messages here.
+                # The hub immediately follows with a context_dump that has the
+                # full history in chronological order.  Rendering here first
+                # causes older messages to appear *after* newer ones in the TUI.
 
                 # Track connected agents
                 self._connected_agents = {}
@@ -812,6 +1050,20 @@ class ChatTUI:
                         }
 
                 agent_count = len(self._connected_agents)
+                # Persist last room so TUI can resume to same room on restart
+                self._db_set("last_room", self.room)
+
+                # Load persisted pins for this room
+                if self.room_id:
+                    self._pinned_messages = {}
+                    for pin in self._db_load_pins(self.room_id):
+                        self._pinned_messages[pin["id"]] = {
+                            "id": pin["id"],
+                            "content": pin["content"],
+                            "sender_name": pin["sender_name"],
+                            "pinned_at": pin.get("pinned_at", ""),
+                        }
+
                 if reconnecting:
                     self.add_system(
                         f"reconnected · room: {self.room} · {agent_count} agent(s)",
@@ -903,13 +1155,13 @@ class ChatTUI:
             self.add_message(msg)
 
         elif t == "context_dump":
+            # Full history from hub, in chronological order (oldest first).
+            # Dedup via _seen_message_ids ensures reconnects don't replay
+            # messages that were already displayed this session.
             msgs = msg.get("messages", [])
-            if msgs:
-                self._append(Separator(f"history ({len(msgs)} messages)"))
-                for m in msgs:
-                    if isinstance(m, dict) and m.get("type") == "message":
-                        self.add_message(m)
-                self._append(Separator("live"))
+            for m in msgs:
+                if isinstance(m, dict) and m.get("type") == "message":
+                    self.add_message(m)
 
         elif t == "directive":
             directive_id = str(msg.get("directive_id", "")).strip()
@@ -983,6 +1235,8 @@ class ChatTUI:
                     style = "denied"
                 elif status in ("done", "completed", "ok"):
                     style = "granted"
+                elif status in ("cancelled", "canceled"):
+                    style = "approval"
                 suffix = f" - {detail}" if detail else ""
                 self.add_system(f"[{name}] {status}{suffix}", style)
             elif action == "agent_session":
@@ -1015,7 +1269,7 @@ class ChatTUI:
                         "granted",
                     )
                 else:
-                    label = target if target else ("human" if scope == "maps" else scope)
+                    label = target if target else scope
                     self.add_system(f"watch set: {watcher} -> {label} (by {updated_by})", "granted")
             elif action == "agents_summoned":
                 targets = ", ".join(str(item) for item in msg.get("targets", [])) or "(none)"
@@ -1033,6 +1287,12 @@ class ChatTUI:
                     f"standdown: {msg.get('issued_by', '?')} released {targets}{suffix}",
                     "system_fg",
                 )
+            elif action == "cancel_response":
+                targets = ", ".join(str(item) for item in msg.get("targets", [])) or "(none)"
+                self.add_system(
+                    f"cancel: {msg.get('issued_by', '?')} -> {targets}",
+                    "approval",
+                )
             elif action == "directive_ack":
                 directive_id = str(msg.get("directive_id", "")).strip() or "?"
                 state = str(msg.get("state", "accepted")).strip().lower() or "accepted"
@@ -1041,6 +1301,60 @@ class ChatTUI:
                     f"directive [{directive_id}] ack: {agent_name} -> {state}",
                     "system_fg",
                 )
+            elif action == "agent_mode_changed":
+                agent_name = str(msg.get("agent", "?")).strip() or "?"
+                mode = str(msg.get("mode", "?")).strip() or "?"
+                changed_by = str(msg.get("changed_by", "?")).strip() or "?"
+                self.add_system(
+                    f"mode: {agent_name} → {mode} (by {changed_by})",
+                    "system_fg",
+                )
+            elif action == "topic_changed":
+                topic = str(msg.get("topic", "")).strip()
+                changed_by = str(msg.get("changed_by", "?")).strip() or "?"
+                self._topic = topic
+                label = f'"{topic}"' if topic else "(cleared)"
+                self.add_system(f"topic: {label} (by {changed_by})", "system_fg")
+                self._update_header()
+
+        elif t in ("room_created", "room_state"):
+            # Mid-session room join/switch (response to /room or /join).
+            room_data = msg.get("room", {})
+            new_room_id = room_data.get("room_id")
+            new_room_name = room_data.get("room_name", self.room)
+            if new_room_id and new_room_id != self.room_id:
+                self.room_id = new_room_id
+                self.room = new_room_name
+                self._last_sender_name = None
+                self._update_header()
+                self.add_system(f"joined room: {new_room_name} [{new_room_id}]", "granted")
+                self._db_set("last_room", self.room)
+                # Load pins for the new room
+                self._pinned_messages = {}
+                for pin in self._db_load_pins(self.room_id):
+                    self._pinned_messages[pin["id"]] = {
+                        "id": pin["id"],
+                        "content": pin["content"],
+                        "sender_name": pin["sender_name"],
+                        "pinned_at": pin.get("pinned_at", ""),
+                    }
+                # context_dump follows and will load history
+
+        elif t == "rooms_list":
+            rooms = msg.get("rooms", [])
+            if not rooms:
+                self.add_system("no rooms", "system_fg")
+            else:
+                self.add_system(f"rooms: {len(rooms)}")
+                for r in rooms:
+                    rid = r.get("id", "?")
+                    rname = r.get("name", "?")
+                    agents = r.get("agent_count", 0)
+                    msgs = r.get("message_count", 0)
+                    current = " ←" if rid == self.room_id else ""
+                    self.add_system(
+                        f"  [{rid}] {rname}  {agents} agent(s)  {msgs} msg(s){current}"
+                    )
 
         elif t == "approval_request":
             self.add_approval_request(msg)
@@ -1119,22 +1433,22 @@ class ChatTUI:
         pool: list[str] = []
         space_if_single = False
 
-        if command in ("enable", "disable") and arg_index == 1:
-            pool = list(_backend_agents())
+        if command in ("enable", "disable", "cancel", "detrigger", "stop") and arg_index == 1:
+            pool = ["all"] + list(BACKEND_AGENTS)
         elif command in ("summon", "standdown", "brief") and arg_index >= 1:
-            pool = ["all"] + list(_backend_agents())
+            pool = ["all"] + list(BACKEND_AGENTS)
         elif command == "mode":
             if arg_index == 1:
-                pool = list(_backend_agents())
+                pool = ["all"] + list(BACKEND_AGENTS)
                 space_if_single = True
             elif arg_index == 2:
-                pool = list(AGENT_MODES)
+                pool = list(AGENT_MODES) + sorted(AGENT_MODE_ALIASES.keys())
         elif command == "watch":
             if arg_index == 1:
-                pool = ["all"] + list(_backend_agents())
+                pool = ["all"] + list(BACKEND_AGENTS)
                 space_if_single = True
             elif arg_index == 2:
-                pool = ["off", "human", "room"] + [f"@{name}" for name in _backend_agents()]
+                pool = ["off", "human", "room"] + [f"@{name}" for name in BACKEND_AGENTS]
         elif command == "theme" and arg_index == 1:
             pool = list(THEMES.keys()) + ["phosphor"]
         elif command in ("autoapprove", "aa") and arg_index == 1:
@@ -1154,23 +1468,91 @@ class ChatTUI:
             "space_if_single": space_if_single,
         }
 
-    def _complete_slash_command(self, reverse: bool = False) -> bool:
-        ctx = self._slash_completion_context()
-        if not ctx:
-            return False
+    @staticmethod
+    def _display_path(path: Path, *, prefer_home: bool = True) -> str:
+        try:
+            home = Path.home().resolve()
+            resolved = path.resolve()
+            if not prefer_home:
+                text = str(path)
+            elif resolved == home:
+                text = "~"
+            elif home in resolved.parents:
+                text = "~/" + str(resolved.relative_to(home))
+            else:
+                text = str(path)
+        except Exception:
+            text = str(path)
+        if path.is_dir() and not text.endswith("/"):
+            text += "/"
+        return text.replace(" ", "\\ ")
 
+    def _file_completion_context(self) -> Optional[dict]:
+        text = self.edit.get_edit_text()
+        cursor = self.edit.edit_pos
+        before = text[:cursor]
+        match = _PATH_RE.search(before)
+        if not match:
+            return None
+
+        prefix = match.group(2)
+        raw_prefix = prefix.replace("\\ ", " ")
+        expanded = Path(os.path.expanduser(raw_prefix))
+        if raw_prefix.endswith("/"):
+            directory = expanded
+            stem = ""
+        else:
+            directory = expanded.parent
+            stem = expanded.name
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return None
+
+        candidates: list[str] = []
+        for entry in sorted(entries, key=lambda p: (not p.is_dir(), p.name.lower())):
+            name = entry.name
+            if not self._show_hidden_file_completions and name.startswith(".") and not stem.startswith("."):
+                continue
+            if not name.startswith(stem):
+                continue
+            candidates.append(self._display_path(entry, prefer_home=prefix.startswith("~")))
+            if len(candidates) >= self._max_file_completion_candidates:
+                break
+        if not candidates:
+            return None
+
+        return {
+            "kind": "file",
+            "key": ("file",),
+            "token_start": match.start(2),
+            "prefix": prefix,
+            "pool": candidates,
+            "space_if_single": True,
+        }
+
+    def _apply_completion_context(self, ctx: dict, reverse: bool = False) -> bool:
         token_start = int(ctx["token_start"])
         prefix = str(ctx["prefix"])
         pool = [str(item) for item in ctx["pool"]]
-        seed = (ctx["key"], token_start, tuple(pool))
+        seed = (ctx["key"], token_start, prefix, tuple(pool))
 
         if self._completion_seed != seed:
-            matches = [item for item in pool if item.lower().startswith(prefix)]
+            matches = [item for item in pool if item.lower().startswith(prefix.lower())]
             if not matches:
                 return False
             self._completion_seed = seed
             self._completion_matches = matches
             self._completion_index = -1
+            if len(matches) > 1:
+                common = os.path.commonprefix(matches)
+                if len(common) > len(prefix):
+                    text = self.edit.get_edit_text()
+                    cursor = self.edit.edit_pos
+                    new_text = text[:token_start] + common + text[cursor:]
+                    self.edit.set_edit_text(new_text)
+                    self.edit.edit_pos = token_start + len(common)
+                    return True
         elif not self._completion_matches:
             return False
 
@@ -1195,6 +1577,8 @@ class ChatTUI:
                 len(self._completion_matches) == 1
                 and choice not in SLASH_NOARG_COMMANDS
             )
+        elif ctx["kind"] == "file":
+            append_space = len(self._completion_matches) == 1 and not choice.endswith("/")
         else:
             append_space = (
                 bool(ctx.get("space_if_single")) and len(self._completion_matches) == 1
@@ -1207,6 +1591,18 @@ class ChatTUI:
         self.edit.set_edit_text(new_text)
         self.edit.edit_pos = new_pos
         return True
+
+    def _complete_slash_command(self, reverse: bool = False) -> bool:
+        ctx = self._slash_completion_context()
+        if not ctx:
+            return False
+        return self._apply_completion_context(ctx, reverse=reverse)
+
+    def _complete_file_path(self, reverse: bool = False) -> bool:
+        ctx = self._file_completion_context()
+        if not ctx:
+            return False
+        return self._apply_completion_context(ctx, reverse=reverse)
 
     def _show_help(self):
         self.add_system("slash commands:")
@@ -1241,10 +1637,12 @@ class ChatTUI:
 
         # ── Tab completion ─────────────────────────────────────────────────
         if key == "tab":
-            self._complete_slash_command(reverse=False)
+            if not self._complete_file_path(reverse=False):
+                self._complete_slash_command(reverse=False)
             return
         if key in ("shift tab", "backtab"):
-            self._complete_slash_command(reverse=True)
+            if not self._complete_file_path(reverse=True):
+                self._complete_slash_command(reverse=True)
             return
 
         self._reset_completion_state()
@@ -1276,7 +1674,9 @@ class ChatTUI:
         # ── Editing shortcuts ──────────────────────────────────────────────
         elif key == "ctrl u":
             self.edit.set_edit_text("")
+            self.edit.edit_pos = 0
             self._history_pos = -1
+            self._reset_completion_state()
 
         elif key == "ctrl l":
             self._clear_messages()
@@ -1289,7 +1689,14 @@ class ChatTUI:
         ):
             self.frame.set_focus("footer")
             self.edit.insert_text(key)
-        elif key in ("ctrl d", "ctrl c", "f10"):
+        elif key == "ctrl c":
+            if self.edit.get_edit_text():
+                self.edit.set_edit_text("")
+                self.edit.edit_pos = 0
+                self._reset_completion_state()
+            else:
+                self.add_system("type /quit to exit", "system_fg")
+        elif key in ("ctrl d", "f10"):
             raise urwid.ExitMainLoop()
 
     async def _handle_user_input(self, text: str):
@@ -1339,6 +1746,15 @@ class ChatTUI:
             await self._send(
                 {"type": "command", "command": "set_auto_approve", "value": val}
             )
+        elif verb == "room":
+            if len(parts) < 2:
+                self.add_system(
+                    f"room: {self.room} [{self.room_id or 'no id'}]",
+                    "system_fg",
+                )
+            else:
+                room_name = " ".join(parts[1:])
+                await self._run_room_command(room_name)
         elif verb == "rooms":
             await self._send({"type": "request", "request": "rooms"})
         elif verb == "join" and len(parts) >= 2:
@@ -1352,7 +1768,10 @@ class ChatTUI:
             await self._run_agent_control(verb, parts[1].lower())
         elif verb == "mode":
             if len(parts) < 3:
-                self.add_system("usage: /mode <agent> <mention|always|off>", "denied")
+                self.add_system(
+                    "usage: /mode <agent|all> <mention|always|handoff|ffa|off>",
+                    "denied",
+                )
                 return
             await self._run_agent_mode(parts[1].lower(), parts[2].lower())
         elif verb == "modes":
@@ -1378,21 +1797,30 @@ class ChatTUI:
             await self._run_rollcall()
         elif verb == "topic":
             if len(parts) >= 2:
-                self._topic = " ".join(parts[1:])
-                self.add_system(f"topic: {self._topic}", "granted")
+                new_topic = " ".join(parts[1:])
+                if self.connected and self.writer and self.room_id:
+                    await self._send({
+                        "type": "command",
+                        "command": "set_topic",
+                        "topic": new_topic,
+                    })
+                else:
+                    # Not connected — apply locally only
+                    self._topic = new_topic
+                    self.add_system(f"topic: {new_topic}", "granted")
             else:
                 self.add_system(f"topic: {self._topic or '(not set)'}", "system_fg")
         elif verb == "search" and len(parts) >= 2:
             query = " ".join(parts[1:]).lower()
             self._run_message_search(query)
         elif verb == "pin" and len(parts) >= 2:
-            try:
-                msg_id = int(parts[1])
-                self._run_pin_message(msg_id)
-            except ValueError:
-                self.add_system("usage: /pin <message_id>", "denied")
+            self._run_pin_message(parts[1])
+        elif verb == "unpin" and len(parts) >= 2:
+            self._run_unpin_message(parts[1])
         elif verb == "pins":
             self._run_list_pins()
+        elif verb == "rename":
+            self._run_rename_command(parts)
         elif verb == "summon":
             await self._run_summon_command(parts[1:])
         elif verb == "brief":
@@ -1401,15 +1829,47 @@ class ChatTUI:
             await self._run_watch_command(parts[1:])
         elif verb == "standdown":
             await self._run_standdown_command(parts[1:])
+        elif verb in ("cancel", "detrigger", "stop"):
+            await self._run_cancel_command(parts[1:])
         elif verb == "clear":
             self._clear_messages()
         elif verb == "restart":
-            full = "--full" in parts[1:] or "full" in parts[1:]
-            self._request_restart(full=full)
+            args = {part.lower() for part in parts[1:]}
+            now = "--now" in args or "now" in args
+            if "hub" in args:
+                if self.connected and self.writer:
+                    await self._send({
+                        "type": "command",
+                        "command": "shutdown",
+                        "mode": "immediate" if now else "graceful",
+                    })
+                self._request_restart(hub=True, now=now)
+                return
+            full = "--full" in args or "full" in args
+            if full and self.connected and self.writer:
+                await self._send({
+                    "type": "command",
+                    "command": "shutdown",
+                    "mode": "immediate" if now else "graceful",
+                })
+            self._request_restart(full=full, now=now)
         elif verb in ("quit", "q", "exit"):
-            self._request_exit()
+            self._request_exit(now="--now" in parts[1:] or "now" in parts[1:])
         else:
             self.add_system(f"unknown command: /{verb} (try /help)", "denied")
+
+    async def _run_room_command(self, room_name: str):
+        """Join an existing room by name, or create it if it doesn't exist."""
+        if not self.connected or not self.writer:
+            self.add_system("not connected", "denied")
+            return
+        # create_room is idempotent: joins if exists, creates if not.
+        # The hub sends back room_state/room_created which _handle_incoming picks up.
+        sent = await self._send(
+            {"type": "command", "command": "create_room", "room_name": room_name}
+        )
+        if sent:
+            self.add_system(f"switching to room: {room_name}…", "system_fg")
 
     async def _run_polycule_cli(self, *args: str) -> tuple[int, str, str]:
         if not POLYCULE_BIN.exists():
@@ -1423,34 +1883,47 @@ class ChatTUI:
         return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
 
     async def _run_agent_control(self, action: str, agent: str):
-        if agent not in _backend_agent_set():
-            allowed = ", ".join(_backend_agents())
-            self.add_system(f"invalid agent: {agent} (use one of: {allowed})", "denied")
+        targets = self._parse_target_agents([agent])
+        if not targets:
+            allowed = ", ".join(BACKEND_AGENTS)
+            self.add_system(
+                f"invalid agent: {agent} (use one of: all, {allowed})",
+                "denied",
+            )
             return
-        code, out, err = await self._run_polycule_cli("agent", action, agent)
-        if code != 0:
-            detail = err or out or f"failed to {action} {agent}"
-            self.add_system(detail, "denied")
-            return
-        self.add_system(out or f"{action}d {agent}", "granted")
+        for target in targets:
+            code, out, err = await self._run_polycule_cli("agent", action, target)
+            if code != 0:
+                detail = err or out or f"failed to {action} {target}"
+                self.add_system(detail, "denied")
+                continue
+            self.add_system(out or f"{action}d {target}", "granted")
 
     async def _run_agent_mode(self, agent: str, mode: str):
-        if agent not in _backend_agent_set():
-            allowed = ", ".join(_backend_agents())
-            self.add_system(f"invalid agent: {agent} (use one of: {allowed})", "denied")
+        targets = self._parse_target_agents([agent])
+        if not targets:
+            allowed = ", ".join(BACKEND_AGENTS)
+            self.add_system(
+                f"invalid agent: {agent} (use one of: all, {allowed})",
+                "denied",
+            )
             return
-        if mode not in AGENT_MODES:
+        normalized_mode = NORMALIZE_AGENT_MODE(mode, default="")
+        if normalized_mode not in AGENT_MODES:
             allowed_modes = ", ".join(AGENT_MODES)
             self.add_system(
                 f"invalid mode: {mode} (use one of: {allowed_modes})", "denied"
             )
             return
-        code, out, err = await self._run_polycule_cli("agent", "mode", agent, mode)
-        if code != 0:
-            detail = err or out or f"failed to set mode {agent}={mode}"
-            self.add_system(detail, "denied")
-            return
-        self.add_system(out or f"set mode {agent}={mode}", "granted")
+        for target in targets:
+            code, out, err = await self._run_polycule_cli(
+                "agent", "mode", target, normalized_mode
+            )
+            if code != 0:
+                detail = err or out or f"failed to set mode {target}={normalized_mode}"
+                self.add_system(detail, "denied")
+                continue
+            self.add_system(out or f"set mode {target}={normalized_mode}", "granted")
 
     async def _run_agent_modes(self):
         code, out, err = await self._run_polycule_cli("agent", "modes")
@@ -1475,10 +1948,32 @@ class ChatTUI:
             if not value:
                 continue
             if value == "all":
-                return list(_backend_agents())
-            if value in _backend_agent_set() and value not in out:
+                return list(BACKEND_AGENTS)
+            if value in BACKEND_AGENT_SET and value not in out:
                 out.append(value)
         return out
+
+    async def _run_cancel_command(self, args: list[str]):
+        if not self.room_id:
+            self.add_system("not connected to a room", "denied")
+            return
+        targets = self._parse_target_agents(args)
+        if not targets:
+            self.add_system("usage: /cancel <agent|all>", "denied")
+            return
+        sent = await self._send(
+            {
+                "type": "command",
+                "command": "cancel_response",
+                "room_id": self.room_id,
+                "targets": targets,
+            }
+        )
+        if sent:
+            self.add_system(
+                f"cancel queued: {', '.join(targets)}",
+                "approval",
+            )
 
     async def _load_agent_state(self) -> dict[str, dict[str, str]]:
         code, out, err = await self._run_polycule_cli("agent", "status")
@@ -1614,7 +2109,7 @@ class ChatTUI:
             return
         if len(args) < 2:
             self.add_system(
-                "usage: /watch <agent|all> <off|human|room|@agent>",
+                    "usage: /watch <agent|all> <off|human|room|@agent>",
                 "denied",
             )
             return
@@ -1717,7 +2212,7 @@ class ChatTUI:
                 continue
             agent, rest = line.split(":", 1)
             name = agent.strip().lower()
-            if name not in _backend_agent_set():
+            if name not in BACKEND_AGENT_SET:
                 continue
             fields: dict[str, str] = {}
             for token in rest.strip().split():
@@ -1739,24 +2234,21 @@ class ChatTUI:
         joined = " ".join(words)
         recommendations: list[tuple[str, int, str]] = []
 
-        backend_agents = _backend_agents()
-        hints = _agent_capability_hints()
-        free_agents = _free_agents()
-        for agent in backend_agents:
+        for agent in BACKEND_AGENTS:
             status = agent_state.get(agent, {})
             current_state = status.get("state", "enabled")
             current_mode = status.get("mode", DEFAULT_AGENT_MODE(agent))
             if current_state != "enabled" or current_mode == "off":
                 continue
 
-            profile = hints.get(agent, {})
+            profile = AGENT_CAPABILITY_HINTS.get(agent, {})
             score = 1
             reasons = []
             for keyword, weight in profile.get("keywords", {}).items():
                 if keyword in joined:
                     score += int(weight)
                     reasons.append(keyword)
-            if agent in free_agents:
+            if agent in FREE_AGENTS:
                 score += 1
             if current_mode == "always":
                 score += 1
@@ -1764,14 +2256,12 @@ class ChatTUI:
                 reasons.append(profile.get("summary", "general fit"))
             recommendations.append((agent, score, ", ".join(reasons[:3])))
 
-        recommendations.sort(key=lambda item: (-item[1], backend_agents.index(item[0])))
+        recommendations.sort(key=lambda item: (-item[1], BACKEND_AGENTS.index(item[0])))
         return recommendations
 
     async def _run_free_mode(self):
         self._free_mode = not self._free_mode
-        paid_agents = _paid_agents()
-        free_agents = list(_free_agents())
-        for agent in paid_agents:
+        for agent in PAID_AGENTS:
             if self._free_mode:
                 code, out, err = await self._run_polycule_cli("agent", "disable", agent)
                 if code != 0:
@@ -1781,10 +2271,7 @@ class ChatTUI:
                 if code != 0:
                     self.add_system(err or out or f"failed to enable {agent}", "denied")
         if self._free_mode:
-            status_msg = (
-                "free mode: only local/non-premium agents enabled "
-                f"({', '.join(free_agents) if free_agents else 'none'})"
-            )
+            status_msg = "free mode: only local/non-premium agents enabled"
         else:
             status_msg = "free mode off: all agents enabled"
         self.add_system(status_msg, "granted" if self._free_mode else "system_fg")
@@ -1800,10 +2287,9 @@ class ChatTUI:
             self.add_system(detail, "denied")
             return
         state = self._parse_agent_status_output(out)
-        backend_agents = _backend_agents()
         active = [
             agent
-            for agent in backend_agents
+            for agent in BACKEND_AGENTS
             if state.get(agent, {}).get("state", "enabled") == "enabled"
             and state.get(agent, {}).get("mode", DEFAULT_AGENT_MODE(agent)) != "off"
         ]
@@ -1826,10 +2312,15 @@ class ChatTUI:
         if not ranked:
             self.add_system("which: no enabled agents available", "denied")
             return
+        def _cost_tag(agent: str) -> str:
+            return "[free]" if agent in FREE_AGENTS else "[paid]"
+
         best_agent, best_score, best_reason = ranked[0]
-        self.add_system(f"which: @{best_agent} ({best_reason})", "granted")
+        self.add_system(
+            f"which: @{best_agent} {_cost_tag(best_agent)} ({best_reason})", "granted"
+        )
         backups = [
-            f"@{agent} ({reason})"
+            f"@{agent} {_cost_tag(agent)} ({reason})"
             for agent, _score, reason in ranked[1:3]
         ]
         if backups:
@@ -1838,24 +2329,107 @@ class ChatTUI:
 
     def _run_message_search(self, query: str):
         """Search messages for query."""
-        matches = 0
-        for msg in self.walker:
-            if hasattr(msg, "content") and query in msg.content.lower():
-                matches += 1
-        self.add_system(f"found {matches} messages matching '{query}'", "system_fg")
+        normalized = str(query or "").strip().lower()
+        if not normalized:
+            self.add_system("usage: /search <query>", "denied")
+            return
+        matches = [
+            record
+            for record in reversed(self._message_log)
+            if normalized in str(record.get("content", "")).lower()
+        ]
+        if not matches:
+            self.add_system(f"search: no matches for '{query}'", "system_fg")
+            return
+        self.add_system(
+            f"search: {len(matches)} match(es) for '{query}'",
+            "system_fg",
+        )
+        for record in matches[:5]:
+            self.add_system(self._format_message_reference(record), "granted")
+        if len(matches) > 5:
+            self.add_system("search: showing 5 most recent matches", "system_fg")
 
-    def _run_pin_message(self, msg_id: int):
-        """Pin a message by ID."""
-        self._pinned_messages[msg_id] = {"id": msg_id, "pinned_at": "now"}
-        self.add_system(f"pinned message {msg_id}", "granted")
+    def _run_pin_message(self, message_ref: str):
+        """Pin a message by ID or unique prefix."""
+        record, error = self._resolve_message_reference(message_ref)
+        if error:
+            self.add_system(error, "denied")
+            return
+        if not record:
+            self.add_system(f"message not found: {message_ref}", "denied")
+            return
+        msg_id = str(record.get("id", "")).strip()
+        if not msg_id:
+            self.add_system("cannot pin message without an id", "denied")
+            return
+        self._pinned_messages[msg_id] = dict(record)
+        self._pinned_messages[msg_id]["pinned_at"] = datetime.now().isoformat()
+        if self.room_id:
+            self._db_save_pin(
+                self.room_id,
+                msg_id,
+                str(record.get("content", "")),
+                str(record.get("sender_name", "?")),
+            )
+        self.add_system(
+            f"pinned {self._format_message_reference(record)}",
+            "granted",
+        )
 
     def _run_list_pins(self):
         """List pinned messages."""
         if not self._pinned_messages:
             self.add_system("no pinned messages", "system_fg")
             return
-        for msg_id in self._pinned_messages:
-            self.add_system(f"pinned: message {msg_id}", "granted")
+        self.add_system(f"pins: {len(self._pinned_messages)}", "system_fg")
+        for record in reversed(list(self._pinned_messages.values())):
+            pinned_at = str(record.get("pinned_at", "")).strip()
+            suffix = f" · {pinned_at}" if pinned_at else ""
+            self.add_system(
+                f"pinned {self._format_message_reference(record)}{suffix}",
+                "granted",
+            )
+
+    def _run_unpin_message(self, message_ref: str):
+        """Unpin a message by ID or unique prefix."""
+        record, error = self._resolve_pin_reference(message_ref)
+        if error:
+            self.add_system(error, "denied")
+            return
+        if not record:
+            self.add_system(f"message not found: {message_ref}", "denied")
+            return
+        msg_id = str(record.get("id", "")).strip()
+        if not msg_id:
+            self.add_system("cannot unpin message without an id", "denied")
+            return
+        if msg_id not in self._pinned_messages:
+            self.add_system(f"not pinned: {self._format_message_reference(record)}", "denied")
+            return
+        del self._pinned_messages[msg_id]
+        if self.room_id:
+            self._db_delete_pin(self.room_id, msg_id)
+        self.add_system(f"unpinned {self._format_message_reference(record)}", "system_fg")
+
+    def _run_rename_command(self, parts: list[str]):
+        """Handle /rename me <name> and /rename <agent> <name>."""
+        if len(parts) < 3:
+            self.add_system("usage: /rename me <name>  OR  /rename <agent> <name>", "denied")
+            return
+        target = parts[1].lower()
+        new_name = " ".join(parts[2:]).strip()
+        if not new_name:
+            self.add_system("name cannot be empty", "denied")
+            return
+        if target == "me":
+            self._save_display_alias("__operator__", new_name)
+            self.name = new_name
+            self.add_system(f"operator name → {new_name} (takes effect on reconnect in hub)", "granted")
+        else:
+            self._save_display_alias(target, new_name)
+            self._last_sender_name = None  # force header refresh
+            self.add_system(f"alias: {target} → {new_name}", "granted")
 
     async def _run_agent_status(self):
         code, out, err = await self._run_polycule_cli("agent", "status")
@@ -1909,12 +2483,19 @@ class ChatTUI:
         self.connected = False
         await self._close_writer()
 
-    def _request_exit(self):
+    def _request_exit(self, now: bool = False):
         self._shutting_down = True
+        self._restart_now = now
         if self._loop:
             self._loop.stop()
 
-    def _request_restart(self, full: bool = False):
+    def _request_restart(self, full: bool = False, hub: bool = False, now: bool = False):
+        self._restart_now = now
+        if hub:
+            self._hub_restart_requested = True
+            self.add_system("hub restart requested...", "system_fg")
+            self._request_exit(now=now)
+            return
         if full:
             self._full_restart_requested = True
             self.add_system(
@@ -1923,7 +2504,7 @@ class ChatTUI:
         else:
             self._restart_requested = True
             self.add_system("restarting TUI — will reconnect to hub…", "system_fg")
-        self._request_exit()
+        self._request_exit(now=now)
 
     # -----------------------------------------------------------------------
     # Run
@@ -1955,7 +2536,13 @@ class ChatTUI:
             loop.close()
 
         if self._full_restart_requested:
-            subprocess.Popen([str(POLYCULE_BIN), "start", "--background", "--new"])
+            args = [str(POLYCULE_BIN), "start", "--background", "--restart"]
+            if self._restart_now:
+                args.append("--no-first-run")
+            subprocess.Popen(args)
+        elif self._hub_restart_requested:
+            subprocess.Popen([str(POLYCULE_BIN), "start", "--background"])
+            os.execv(sys.executable, sys.argv)
         elif self._restart_requested:
             os.execv(sys.executable, sys.argv)
 
@@ -1968,9 +2555,9 @@ class ChatTUI:
 def main():
     parser = argparse.ArgumentParser(description="Polycule Chat TUI")
     parser.add_argument("--name", default=DEFAULT_HUMAN_NAME)
-    parser.add_argument("--room", default="Default")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--room", default=CONFIG.operator.room)
+    parser.add_argument("--host", default=CONFIG.hub.host)
+    parser.add_argument("--port", type=int, default=CONFIG.hub.port)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING)

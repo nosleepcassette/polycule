@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 OpenCode Adapter for Polycule Hub
 
@@ -34,7 +34,8 @@ OPENCODE_BIN = "opencode"
 BOOTSTRAP_CONTEXT_LIMIT = 40
 RESUME_FALLBACK_CONTEXT_LIMIT = 12
 
-TRIGGER_PHRASES = frozenset({"@opencode", "opencode", "hey opencode"})
+MENTION_TRIGGERS = frozenset({"@opencode"})
+HUMAN_WORD_TRIGGERS = frozenset({"opencode"})
 
 SYSTEM_PROMPT = """You are OpenCode, an AI coding agent participating in the Polycule
 multi-agent workspace. You specialize in code generation, debugging, and technical
@@ -52,6 +53,8 @@ class OpenCodeAdapter(BaseAdapter):
         hub_host: str = "localhost",
         hub_port: int = 7777,
         always_respond: bool = False,
+        always_all: bool = False,
+        agent_handoffs: bool = False,
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
     ):
@@ -64,6 +67,8 @@ class OpenCodeAdapter(BaseAdapter):
         )
         super().__init__(config)
         self.always_respond = always_respond
+        self.always_all = always_all
+        self.agent_handoffs = agent_handoffs
         self.resume_session = resume_session
         self._responding = False
         self._cwd = str(Path.cwd().resolve())
@@ -229,12 +234,22 @@ class OpenCodeAdapter(BaseAdapter):
             return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
-        if self.always_respond:
+        sender_type = self.sender_type(message)
+        content = message.get("content", "")
+        if self.always_all:
             return True
+        if self.always_respond:
+            return sender_type == "human"
         if self._watch_matches_message(message):
             return True
-        content = message.get("content", "").lower()
-        return any(trigger in content for trigger in TRIGGER_PHRASES)
+        if sender_type == "human":
+            return self.has_any_trigger(content, MENTION_TRIGGERS | HUMAN_WORD_TRIGGERS)
+        return self.agent_message_matches(
+            content,
+            MENTION_TRIGGERS,
+            HUMAN_WORD_TRIGGERS,
+            allow_plaintext=self.agent_handoffs,
+        )
 
     async def _call_opencode(self, prompt: str) -> Optional[str]:
         cmd = self._build_cmd(prompt)
@@ -243,6 +258,8 @@ class OpenCodeAdapter(BaseAdapter):
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
+            return
+        if not self._claim_response_message(message):
             return
 
         self._responding = True
@@ -254,6 +271,7 @@ class OpenCodeAdapter(BaseAdapter):
             )
         try:
             prompt = self._build_prompt(message)
+            await self.set_typing(True)
             response = await self._call_opencode(prompt)
             if response:
                 session_id, session_event = self._capture_session_id(session_snapshot)
@@ -266,11 +284,23 @@ class OpenCodeAdapter(BaseAdapter):
                     self._persist_session_state(last_message_id=message_id)
             else:
                 logger.warning("OpenCode returned no response")
+        except asyncio.CancelledError:
+            detail = self.consume_cancel_reason() or "response cancelled"
+            logger.info("OpenCode response cancelled: %s", detail)
+            await self.send_status("cancelled", detail)
+            raise
         finally:
+            await self.set_typing(False)
             self._responding = False
 
     async def handle_context_dump(self, messages: list):
         logger.info("OpenCode context loaded: %s historical messages", len(messages))
+
+    def _on_mode_changed(self, mode: str):
+        self.always_respond = (mode == "always")
+        self.always_all = (mode == "ffa")
+        self.agent_handoffs = (mode == "handoff")
+        logger.info("%s mode updated → %s", self.config.name, mode)
 
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
@@ -287,6 +317,7 @@ class OpenCodeAdapter(BaseAdapter):
         if isinstance(refs, list) and refs:
             content += "\n\nRefs:\n" + "\n".join(f"- {item}" for item in refs if item)
         synthetic = {
+            "id": f"directive:{directive_id or 'unknown'}:opencode",
             "type": "message",
             "sender": {
                 "id": str(message.get("issued_by_id", "")),
@@ -295,7 +326,7 @@ class OpenCodeAdapter(BaseAdapter):
             },
             "content": f"@opencode directive ({message.get('directive_kind', 'brief')}):\n{content}",
         }
-        await self.handle_message(synthetic)
+        self._schedule_message_handling(synthetic)
 
 
 def main():
@@ -304,7 +335,17 @@ def main():
     parser.add_argument("--room", default="Default")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=7777)
-    parser.add_argument("--always", action="store_true", help="Respond to all messages")
+    parser.add_argument("--always", action="store_true", help="Respond to all human messages")
+    parser.add_argument(
+        "--always-all",
+        action="store_true",
+        help="Respond to all messages (unsafe: can trigger loops)",
+    )
+    parser.add_argument(
+        "--agent-handoffs",
+        action="store_true",
+        help="Allow agent-to-agent plaintext handoffs without @mentions",
+    )
     parser.add_argument("--session-title", default=None)
     parser.add_argument(
         "--resume",
@@ -325,6 +366,8 @@ def main():
         hub_host=args.host,
         hub_port=args.port,
         always_respond=args.always,
+        always_all=args.always_all,
+        agent_handoffs=args.agent_handoffs,
         session_title=args.session_title,
         resume_session=args.resume,
     )

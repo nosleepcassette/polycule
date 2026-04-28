@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Hermes Adapter for Polycule Hub
 
@@ -120,6 +120,7 @@ class HermesAdapter(BaseAdapter):
         hub_port: int = 7777,
         always_respond: bool = False,
         always_all: bool = False,
+        agent_handoffs: bool = False,
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
         timeout_seconds: float = DEFAULT_HERMES_TIMEOUT_SECONDS,
@@ -135,6 +136,7 @@ class HermesAdapter(BaseAdapter):
         self.profile = normalize_hermes_profile(profile)
         self.always_respond = always_respond
         self.always_all = always_all
+        self.agent_handoffs = agent_handoffs
         self.resume_session = resume_session
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self._responding = False
@@ -224,7 +226,12 @@ class HermesAdapter(BaseAdapter):
             return self.has_any_trigger(
                 content, self._mention_triggers | self._human_word_triggers
             )
-        return self.has_any_trigger(content, self._mention_triggers)
+        return self.agent_message_matches(
+            content,
+            self._mention_triggers,
+            self._human_word_triggers,
+            allow_plaintext=self.agent_handoffs,
+        )
 
     # -----------------------------------------------------------------------
     # Prompt construction
@@ -548,6 +555,19 @@ class HermesAdapter(BaseAdapter):
             f"Approval request {req_id}: {requester} wants {command} (awaiting human approval)"
         )
 
+    def _on_mode_changed(self, mode: str):
+        self.always_respond = mode == "always"
+        self.always_all = mode == "ffa"
+        self.agent_handoffs = mode == "handoff"
+        logger.info(
+            "%s mode updated -> %s (always=%s ffa=%s handoff=%s)",
+            self.profile,
+            mode,
+            self.always_respond,
+            self.always_all,
+            self.agent_handoffs,
+        )
+
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
             return
@@ -606,6 +626,11 @@ def main():
         help="Respond to all messages (unsafe: can trigger loops)",
     )
     parser.add_argument(
+        "--agent-handoffs",
+        action="store_true",
+        help="Allow agent-to-agent plaintext handoffs without @mentions",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         metavar="SESSION_ID",
@@ -637,6 +662,7 @@ def main():
         hub_port=args.port,
         always_respond=args.always,
         always_all=args.always_all,
+        agent_handoffs=args.agent_handoffs,
         resume_session=args.resume,
         session_title=args.session_title,
         timeout_seconds=args.timeout,

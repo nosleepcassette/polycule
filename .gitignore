@@ -10,6 +10,7 @@ logs/
 polycule.db
 polycule.db-shm
 polycule.db-wal
+polycule.toml
 
 garden/
 hermes_conversation_*.json

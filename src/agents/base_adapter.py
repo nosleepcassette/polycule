@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Agent Base Adapter — connects AI agents to polycule hub.
 
@@ -10,10 +10,10 @@ Each adapter:
 """
 import asyncio
 import json
-import os
-import subprocess
 import re
 import sys
+import contextlib
+from collections import deque
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 import logging
@@ -49,15 +49,19 @@ class BaseAdapter:
         self._seen_message_ids: set[str] = set()
         self._seen_message_order: List[str] = []
         self._seen_message_cap = 2000
+        self._handled_response_message_ids: set[str] = set()
+        self._handled_response_message_order: List[str] = []
+        self._handled_response_cap = 2000
+        self._response_task: Optional[asyncio.Task] = None
+        self._message_queue: deque = deque(maxlen=3)
+        self._current_process: Optional[asyncio.subprocess.Process] = None
+        self._cancel_reason = ""
         self.running = True
+        self._reconnect_base_delay = 1.0
+        self._reconnect_max_delay = 15.0
         self.log = logging.getLogger(f"polycule.agent.{config.name}")
         self.watch_scope = "none"
         self.watch_target = ""
-        self.operator_name = (
-            os.environ.get("POLYCULE_OPERATOR_NAME")
-            or os.environ.get("USER")
-            or "maps"
-        ).strip().lower()
         self._load_watch_state()
 
     # ------------------------------------------------------------------
@@ -68,7 +72,8 @@ class BaseAdapter:
         """Connect to hub, send handshake, receive initial room state."""
         try:
             self.reader, self.writer = await asyncio.open_connection(
-                self.config.hub_host, self.config.hub_port
+                self.config.hub_host, self.config.hub_port,
+                limit=2**22  # 4MB line limit — context dumps can be large
             )
 
             # Handshake — include room_name so hub can route immediately
@@ -114,6 +119,7 @@ class BaseAdapter:
 
         except Exception as e:
             self.log.error(f"Connection failed: {e}")
+            await self._close_connection()
             return False
 
     # ------------------------------------------------------------------
@@ -160,30 +166,64 @@ class BaseAdapter:
         self.writer.write((json.dumps(msg) + '\n').encode())
         await self.writer.drain()
 
+    async def set_typing(self, is_typing: bool):
+        """Broadcast a typing indicator for this agent."""
+        if not self.room_id:
+            return
+        await self.send_command("agent_typing", is_typing=is_typing)
+
     # ------------------------------------------------------------------
     # Receiving / main loop
     # ------------------------------------------------------------------
 
     async def run(self):
-        """Connect and run the receive loop."""
-        if not await self.connect():
-            self.log.error("Could not connect to hub, exiting")
-            return
+        """Connect and stay attached to the hub, reconnecting when needed."""
+        attempt = 0
 
-        while self.running and self.reader:
-            try:
-                data = await asyncio.wait_for(self.reader.readline(), timeout=30.0)
-                if not data:
-                    self.log.info("Hub closed connection")
+        while self.running:
+            if not await self.connect():
+                attempt += 1
+                delay = min(
+                    self._reconnect_max_delay,
+                    self._reconnect_base_delay * (2 ** (attempt - 1)),
+                )
+                self.log.warning(
+                    "Connect failed; retrying in %.1fs (attempt %s)",
+                    delay,
+                    attempt,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
                     break
-                msg = json.loads(data.decode().strip())
-                await self._dispatch(msg)
-            except asyncio.TimeoutError:
                 continue
-            except json.JSONDecodeError as e:
-                self.log.warning(f"Bad JSON from hub: {e}")
-            except Exception as e:
-                self.log.error(f"Receive loop error: {e}")
+
+            if attempt:
+                self.log.info("Reconnected to hub after %s attempt(s)", attempt)
+            attempt = 0
+
+            reconnect_required = False
+            while self.running and self.reader:
+                try:
+                    data = await asyncio.wait_for(self.reader.readline(), timeout=30.0)
+                    if not data:
+                        self.log.info("Hub closed connection")
+                        reconnect_required = True
+                        break
+                    msg = json.loads(data.decode().strip())
+                    await self._dispatch(msg)
+                except asyncio.TimeoutError:
+                    continue
+                except json.JSONDecodeError as e:
+                    self.log.warning(f"Bad JSON from hub: {e}")
+                except Exception as e:
+                    self.log.error(f"Receive loop error: {e}")
+                    reconnect_required = self.running
+                    break
+
+            await self._close_connection()
+
+            if not self.running or not reconnect_required:
                 break
 
         await self.disconnect()
@@ -195,7 +235,8 @@ class BaseAdapter:
         if msg_type == 'message':
             added = self._append_context_message(msg)
             if added:
-                await self.handle_message(msg)
+                self._schedule_message_handling(msg)
+                await asyncio.sleep(0)
 
         elif msg_type == 'context_dump':
             msgs = msg.get('messages', [])
@@ -247,7 +288,7 @@ class BaseAdapter:
     def _watch_matches_message(self, message: dict) -> bool:
         """
         Phase 1 watch policy:
-        - `human` / `maps`: respond to direct human input from the operator without needing a mention
+        - `human`: respond to direct human input without needing a mention
         - `room`: respond to human room traffic without needing a mention
         - `agent:<name>` is tracked and persisted, but remains observe-only for now
         """
@@ -255,8 +296,8 @@ class BaseAdapter:
         sender_type = str(sender.get("type", "")).lower()
         sender_name = str(sender.get("name", "")).lower()
 
-        if self.watch_scope in ("maps", "human"):
-            return sender_type == "human" and sender_name == self.operator_name
+        if self.watch_scope in ("human", "maps"):
+            return sender_type == "human"
         if self.watch_scope == "room":
             return sender_type == "human"
         return False
@@ -344,6 +385,31 @@ class BaseAdapter:
                     self.watch_scope,
                     self.watch_target,
                 )
+        elif action == "cancel_response":
+            issued_by = str(message.get("issued_by", "")).strip() or "unknown"
+            targets = [
+                str(item).strip().lower()
+                for item in message.get("targets", [])
+                if str(item).strip()
+            ]
+            my_name = self.config.name.strip().lower()
+            if "all" in targets or my_name in targets:
+                await self.cancel_active_response(f"stopped by {issued_by}")
+        elif action == "agent_mode_changed":
+            target = str(message.get("agent", "")).strip().lower()
+            if target == self.config.name.strip().lower():
+                mode = str(message.get("mode", "")).strip().lower()
+                if mode:
+                    self._on_mode_changed(mode)
+        elif action == "shutdown_announced":
+            mode = str(message.get("mode", "graceful")).strip().lower()
+            issued_by = str(message.get("issued_by", "hub")).strip() or "hub"
+            if mode == "immediate":
+                await self.cancel_active_response(f"shutdown by {issued_by}")
+            elif self._response_task and not self._response_task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._response_task
+            self.running = False
 
     async def handle_approval_request(self, message: dict):
         """Called when hub requests approval for a structural command."""
@@ -351,6 +417,13 @@ class BaseAdapter:
             f"Approval request {message.get('request_id')}: "
             f"{message.get('command')} from {message.get('requester')}"
         )
+
+    def _on_mode_changed(self, mode: str):
+        """
+        Called when the hub broadcasts an agent_mode_changed event targeting
+        this adapter.  Override in subclasses to update trigger policy live.
+        """
+        self.log.info("Mode changed → %s (base: no-op; override to apply)", mode)
 
     async def handle_directive(self, message: dict):
         """Called when the hub emits a targeted directive."""
@@ -365,18 +438,155 @@ class BaseAdapter:
     # Cleanup
     # ------------------------------------------------------------------
 
-    async def disconnect(self):
-        self.running = False
+    async def _close_connection(self):
         if self.writer and not self.writer.is_closing():
             self.writer.close()
             try:
                 await self.writer.wait_closed()
             except Exception:
                 pass
+        self.writer = None
+        self.reader = None
+        self.room_id = None
+
+    async def disconnect(self):
+        self.running = False
+        if self._response_task and not self._response_task.done():
+            await self.cancel_active_response("adapter shutting down")
+        await self._close_connection()
 
     # ------------------------------------------------------------------
     # Helper: run subprocess non-blocking
     # ------------------------------------------------------------------
+
+    def _schedule_message_handling(self, message: dict):
+        if self._response_task and not self._response_task.done():
+            self._message_queue.append(message)  # drops oldest if maxlen exceeded
+            return
+
+        should_respond = getattr(self, "_should_respond", None)
+        if callable(should_respond):
+            try:
+                if not bool(should_respond(message)):
+                    return
+            except Exception as e:
+                self.log.error("Trigger evaluation failed: %s", e)
+                return
+
+        task = asyncio.create_task(self.handle_message(message))
+        self._response_task = task
+        task.add_done_callback(self._on_response_task_done)
+
+    def _on_response_task_done(self, task: asyncio.Task):
+        if self._response_task is task:
+            self._response_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            self.log.info("Response task cancelled")
+        except Exception as e:
+            self.log.error("Response task failed: %s", e)
+        # Process any queued message that arrived while we were busy
+        if self._message_queue:
+            next_msg = self._message_queue.popleft()
+            self._schedule_message_handling(next_msg)
+
+    def _claim_response_message(self, message: dict) -> bool:
+        msg_id = str(message.get("id", "")).strip()
+        if not msg_id:
+            return True
+        if msg_id in self._handled_response_message_ids:
+            return False
+        self._handled_response_message_ids.add(msg_id)
+        self._handled_response_message_order.append(msg_id)
+        if len(self._handled_response_message_order) > self._handled_response_cap:
+            old = self._handled_response_message_order.pop(0)
+            self._handled_response_message_ids.discard(old)
+        return True
+
+    def consume_cancel_reason(self) -> str:
+        reason = self._cancel_reason
+        self._cancel_reason = ""
+        return reason
+
+    async def _terminate_current_process(self):
+        proc = self._current_process
+        if not proc or proc.returncode is not None:
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+
+    async def cancel_active_response(self, reason: str = "cancelled") -> bool:
+        task = self._response_task
+        if not task or task.done():
+            return False
+        self._cancel_reason = str(reason or "").strip() or "cancelled"
+        await self._terminate_current_process()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return True
+
+    async def run_subprocess_capture(
+        self,
+        cmd: List[str],
+        input_text: Optional[str] = None,
+        timeout: float = 60.0,
+        cwd: Optional[Path] = None,
+    ) -> tuple[Optional[int], str, str, Optional[str]]:
+        """
+        Run a subprocess without blocking the event loop.
+
+        Returns (returncode, stdout, stderr, error_kind) where error_kind is
+        one of None, "timeout", or "error". Cancellation is re-raised so
+        callers can surface user-triggered stop requests cleanly.
+        """
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=(
+                    asyncio.subprocess.PIPE
+                    if input_text is not None
+                    else asyncio.subprocess.DEVNULL
+                ),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(cwd) if cwd else None,
+            )
+        except Exception as e:
+            self.log.error("Subprocess %s failed to start: %s", cmd[0], e)
+            return None, "", "", "error"
+
+        self._current_process = process
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(
+                process.communicate(
+                    input_text.encode() if input_text is not None else None
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            await self._terminate_current_process()
+            self.log.warning("Subprocess %s timed out after %ss", cmd[0], timeout)
+            return None, "", "", "timeout"
+        except asyncio.CancelledError:
+            await self._terminate_current_process()
+            raise
+        except Exception as e:
+            await self._terminate_current_process()
+            self.log.error("Subprocess %s failed: %s", cmd[0], e)
+            return None, "", "", "error"
+        finally:
+            self._current_process = None
+
+        stdout = stdout_data.decode(errors="replace").strip()
+        stderr = stderr_data.decode(errors="replace").strip()
+        return process.returncode, stdout, stderr, None
 
     async def run_subprocess(
         self,
@@ -386,23 +596,43 @@ class BaseAdapter:
         cwd: Optional[Path] = None,
     ) -> Optional[str]:
         """Run a subprocess without blocking the event loop."""
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                input=input_text,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=cwd,
-            )
-            if result.returncode == 0:
-                return result.stdout.strip()
-            self.log.warning(f"Subprocess {cmd[0]} exited {result.returncode}: {result.stderr[:200]}")
+        returncode, stdout, stderr, error_kind = await self.run_subprocess_capture(
+            cmd,
+            input_text=input_text,
+            timeout=timeout,
+            cwd=cwd,
+        )
+        if error_kind is not None:
             return None
-        except subprocess.TimeoutExpired:
-            self.log.warning(f"Subprocess {cmd[0]} timed out after {timeout}s")
-            return None
-        except Exception as e:
-            self.log.error(f"Subprocess {cmd[0]} failed: {e}")
-            return None
+        if returncode == 0:
+            return stdout
+        self.log.warning(
+            "Subprocess %s exited %s: %s",
+            cmd[0],
+            returncode,
+            stderr[:200],
+        )
+        return None
+
+    def agent_message_matches(
+        self,
+        content: str,
+        mention_triggers: set[str] | frozenset[str],
+        plaintext_triggers: set[str] | frozenset[str] = frozenset(),
+        *,
+        allow_plaintext: bool = False,
+    ) -> bool:
+        triggers = set(mention_triggers)
+        if allow_plaintext:
+            triggers.update(plaintext_triggers)
+        return self.has_any_trigger(content, frozenset(triggers))
+
+    @staticmethod
+    def is_agent_message(message: dict) -> bool:
+        sender = message.get("sender", {})
+        return str(sender.get("type", "")).lower() != "human"
+
+    @staticmethod
+    def sender_type(message: dict) -> str:
+        sender = message.get("sender", {})
+        return str(sender.get("type", "")).lower()

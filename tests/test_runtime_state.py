@@ -85,13 +85,13 @@ class RuntimeStateTests(unittest.TestCase):
             "wizard",
             "Default",
             db_path=self.db_path,
-            scope="maps",
+            scope="human",
             updated_by="maps",
         )
         entry = get_agent_watch_entry("wizard", "Default", db_path=self.db_path)
         self.assertIsNotNone(entry)
-        self.assertEqual("maps", entry["scope"])
-        self.assertEqual("maps", entry["target"])
+        self.assertEqual("human", entry["scope"])
+        self.assertEqual("", entry["target"])
 
         clear_agent_watch_entry("wizard", "Default", db_path=self.db_path)
         self.assertIsNone(

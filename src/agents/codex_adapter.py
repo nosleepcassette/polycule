@@ -1,4 +1,4 @@
-# maps · cassette.help · MIT
+# Polycule · MIT
 """
 Codex Adapter for Polycule Hub
 
@@ -50,23 +50,6 @@ implementation. Respond to messages directed at you. Be concise and technical. \
 When providing code, wrap it in appropriate fences."""
 
 
-def _env_truthy(name: str) -> bool:
-    value = os.environ.get(name, "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_path_list(name: str) -> list[str]:
-    raw = os.environ.get(name, "")
-    if not raw.strip():
-        return []
-    items = []
-    for part in raw.split(os.pathsep):
-        expanded = os.path.expanduser(part.strip())
-        if expanded:
-            items.append(expanded)
-    return items
-
-
 class CodexAdapter(BaseAdapter):
     """Codex non-interactive adapter using `codex exec`."""
 
@@ -78,6 +61,7 @@ class CodexAdapter(BaseAdapter):
         hub_port: int = 7777,
         always_respond: bool = False,
         always_all: bool = False,
+        agent_handoffs: bool = False,
         resume_session: Optional[str] = None,
         session_title: Optional[str] = None,
     ):
@@ -91,6 +75,7 @@ class CodexAdapter(BaseAdapter):
         super().__init__(config)
         self.always_respond = always_respond
         self.always_all = always_all
+        self.agent_handoffs = agent_handoffs
         self.resume_session = resume_session
         self._responding = False
         self._cwd = str(Path.cwd().resolve())
@@ -105,15 +90,34 @@ class CodexAdapter(BaseAdapter):
             self.session_title = get_or_allocate_agent_session_title(self.session_key)
 
     def _build_cmd(self, prompt: str) -> list[str]:
-        cmd = [self._bin, "exec"]
+        safety_flags: list[str] = []
+        if os.environ.get("POLYCULE_CODEX_DANGEROUS_BYPASS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            safety_flags.append("--dangerously-bypass-approvals-and-sandbox")
+        add_dirs = os.environ.get("POLYCULE_CODEX_ADD_DIRS", "")
+        for raw_dir in add_dirs.split(":"):
+            value = raw_dir.strip()
+            if value:
+                safety_flags.extend(["--add-dir", os.path.expanduser(value)])
         if self.resume_session:
-            cmd.extend(["resume", self.resume_session])
-        if _env_truthy("POLYCULE_CODEX_DANGEROUS_BYPASS"):
-            cmd.append("--dangerously-bypass-approvals-and-sandbox")
-        for extra_dir in _env_path_list("POLYCULE_CODEX_ADD_DIRS"):
-            cmd.extend(["--add-dir", extra_dir])
-        cmd.append(prompt)
-        return cmd
+            return [
+                self._bin,
+                "exec",
+                "resume",
+                self.resume_session,
+                *safety_flags,
+                prompt,
+            ]
+        return [
+            self._bin,
+            "exec",
+            *safety_flags,
+            prompt,
+        ]
 
     def _load_saved_session_state(self):
         entry = get_agent_session_entry(self.session_key)
@@ -259,7 +263,7 @@ class CodexAdapter(BaseAdapter):
             return False
         if sender.get("name", "").lower() == self.config.name.lower():
             return False
-        sender_type = sender.get("type", "").lower()
+        sender_type = self.sender_type(message)
         content = message.get("content", "")
 
         if self.always_all:
@@ -271,7 +275,12 @@ class CodexAdapter(BaseAdapter):
 
         if sender_type == "human":
             return self.has_any_trigger(content, MENTION_TRIGGERS | HUMAN_WORD_TRIGGERS)
-        return self.has_any_trigger(content, MENTION_TRIGGERS)
+        return self.agent_message_matches(
+            content,
+            MENTION_TRIGGERS,
+            HUMAN_WORD_TRIGGERS,
+            allow_plaintext=self.agent_handoffs,
+        )
 
     async def _call_codex(self, prompt: str) -> Optional[str]:
         cmd = self._build_cmd(prompt)
@@ -280,6 +289,8 @@ class CodexAdapter(BaseAdapter):
 
     async def handle_message(self, message: dict):
         if not self._should_respond(message):
+            return
+        if not self._claim_response_message(message):
             return
 
         self._responding = True
@@ -291,6 +302,7 @@ class CodexAdapter(BaseAdapter):
             )
         try:
             prompt = self._build_prompt(message)
+            await self.set_typing(True)
             response = await self._call_codex(prompt)
             if response:
                 session_id, session_event = self._capture_session_id(session_snapshot)
@@ -303,11 +315,23 @@ class CodexAdapter(BaseAdapter):
                     self._persist_session_state(last_message_id=message_id)
             else:
                 logger.warning("Codex returned no response")
+        except asyncio.CancelledError:
+            detail = self.consume_cancel_reason() or "response cancelled"
+            logger.info("Codex response cancelled: %s", detail)
+            await self.send_status("cancelled", detail)
+            raise
         finally:
+            await self.set_typing(False)
             self._responding = False
 
     async def handle_context_dump(self, messages: list):
         logger.info("Codex context loaded: %s historical messages", len(messages))
+
+    def _on_mode_changed(self, mode: str):
+        self.always_respond = (mode == "always")
+        self.always_all = (mode == "ffa")
+        self.agent_handoffs = (mode == "handoff")
+        logger.info("%s mode updated → %s", self.config.name, mode)
 
     async def handle_directive(self, message: dict):
         if not self._directive_targets_me(message):
@@ -324,6 +348,7 @@ class CodexAdapter(BaseAdapter):
         if isinstance(refs, list) and refs:
             content += "\n\nRefs:\n" + "\n".join(f"- {item}" for item in refs if item)
         synthetic = {
+            "id": f"directive:{directive_id or 'unknown'}:codex",
             "type": "message",
             "sender": {
                 "id": str(message.get("issued_by_id", "")),
@@ -332,7 +357,7 @@ class CodexAdapter(BaseAdapter):
             },
             "content": f"@codex directive ({message.get('directive_kind', 'brief')}):\n{content}",
         }
-        await self.handle_message(synthetic)
+        self._schedule_message_handling(synthetic)
 
 
 def main():
@@ -350,6 +375,11 @@ def main():
         "--always-all",
         action="store_true",
         help="Respond to all messages (unsafe: can trigger loops)",
+    )
+    parser.add_argument(
+        "--agent-handoffs",
+        action="store_true",
+        help="Allow agent-to-agent plaintext handoffs without @mentions",
     )
     parser.add_argument("--session-title", default=None)
     parser.add_argument(
@@ -372,6 +402,7 @@ def main():
         hub_port=args.port,
         always_respond=args.always,
         always_all=args.always_all,
+        agent_handoffs=args.agent_handoffs,
         session_title=args.session_title,
         resume_session=args.resume,
     )

@@ -1,7 +1,7 @@
 # polycule
-
-![Polycule Screenshot 1](screen1.png)
-![Polycule Screenshot 2](screen2.png)
+![Polycule Screenshot 1](polycule.png)
+![Polycule Screenshot 2](screen1.png)
+![Polycule Screenshot 3](screen2.png)
 
 Polycule is a local multi-agent terminal workspace. It gives you a tmux layout,
 a local TCP hub, an IRC-style chat TUI, and one shared room where multiple agent
